@@ -7,7 +7,7 @@
 Send `/batch` (or `/login`) to your Telegram bot and open the private web page. Enter **one email per line** and **the shared password once**. The bot attempts the following for each account, in order:
 
 1. Destroy the previous account browser and start a fresh, isolated Chromium browser/context.
-2. Fill the account email and shared password and submit sign-in once.
+2. Wait up to 30 seconds for the sign-in form, reject optional cookies if that banner is present, fill the account email and shared password, and submit sign-in once.
 3. Wait for sign-in. Pause for CAPTCHA, email verification, 2FA, login errors, or an unrecognized page.
 4. Check the signed-in email. If it cannot read the email reliably from the page/profile menu, pause for your explicit identity confirmation.
 5. Open the API Keys page and create form, and assign a unique `personal-batch-…` key name.
@@ -258,7 +258,7 @@ Downloaded `.env` files are **plaintext secrets**. Do not send them to this chat
 
 ## Tests and verification
 
-The current suite has **28 passing tests**. Added checks accept 100 emails through both validation and the HTTP endpoint, reject 101 under the default configuration, exercise maximum-length addresses, validate configurable bounds, and check that the extended session deadline cannot be reset by starting another batch. Checks cover Python/JavaScript syntax, webhook authentication, owner allowlisting, duplicate updates, link replay protection, expiry/revocation, origin checks, bounded email lists, explicit risk consents, password cleanup, secret-free status responses, CSV formula-injection protection, identity pauses, and no duplicate Create after an ambiguous submission. Real Chromium tests exercise login, both permission choices, the leak-protection switch, key capture, and two fresh isolated account browsers against intercepted fixture pages. Frontend tests cover entering one shared password, acknowledgement requirements, clearing credential fields and downloading results. These fixtures are not the authenticated ElevenLabs site.
+The current suite has **29 passing tests**. Added checks accept 100 emails through both validation and the HTTP endpoint, reject 101 under the default configuration, exercise maximum-length addresses, validate configurable bounds, and check that the extended session deadline cannot be reset by starting another batch. Checks cover Python/JavaScript syntax, webhook authentication, owner allowlisting, duplicate updates, link replay protection, expiry/revocation, origin checks, bounded email lists, explicit risk consents, password cleanup, secret-free status responses, CSV formula-injection protection, identity pauses, and no duplicate Create after an ambiguous submission. Real Chromium tests exercise login, both permission choices, the leak-protection switch, key capture, and two fresh isolated account browsers against intercepted fixture pages. Frontend tests cover entering one shared password, acknowledgement requirements, clearing credential fields and downloading results. These fixtures are not the authenticated ElevenLabs site.
 
 Run in a development environment:
 
@@ -269,7 +269,9 @@ MAX_BATCH_ACCOUNTS=100 BATCH_SESSION_MINUTES=240 python -m pytest -q -o asyncio_
 node --check web/app.js
 ```
 
-**Not verified:** a Render deployment, a live Telegram bot token, your Supabase project, authenticated ElevenLabs navigation or key creation, or paid/free solver acceptance. No real credentials are included in this package.
+**Deployment smoke checks completed:** the live website health endpoint, Telegram webhook registration, owner-only private-link flow, and rendering the real ElevenLabs sign-in page.
+
+**Not verified:** authenticated ElevenLabs navigation or key creation, a 100-account live run, your Supabase project, or paid/free solver acceptance. No real credentials are included in this package.
 
 ### Reference documentation
 

@@ -191,7 +191,7 @@ class ElevenUI:
             raise NeedsInput('Remote page is not elevenlabs.io. Credentials were not submitted.')
         email = p.locator('input[type="email"]:visible').first
         try:
-            await email.wait_for(state='visible', timeout=10000)
+            await email.wait_for(state='visible', timeout=30000)
         except Exception:
             for label in (r'^(sign in|log in|continue) with email$', r'^use email$'):
                 button = await first_visible(p.get_by_role('button', name=re.compile(label, re.I)))
@@ -200,6 +200,9 @@ class ElevenUI:
                     break
         if not await email.count() or not await email.is_visible():
             raise NeedsInput('Email sign-in form not found. Select email sign-in below and Resume.')
+        cookie_reject = await first_visible(p.get_by_role('button', name=re.compile(r'^Reject all$', re.I)))
+        if cookie_reject is not None:
+            await cookie_reject.click()
         if row.login_attempted:
             # Never repeat a submitted password automatically.
             return
@@ -250,7 +253,7 @@ class ElevenUI:
                 return
         await self.page.goto(KEYS_URL, wait_until='domcontentloaded', timeout=30000)
         try:
-            await self.page.get_by_role('button', name=CREATE_RE).first.wait_for(state='visible', timeout=10000)
+            await self.page.get_by_role('button', name=CREATE_RE).first.wait_for(state='visible', timeout=30000)
         except Exception:
             raise NeedsInput('API Keys page not recognized. Navigate to API Keys manually and Resume.')
 

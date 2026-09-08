@@ -112,9 +112,9 @@ async def guard(request, handler):
         response = web.json_response({'error': str(exc)}, status=400)
     except web.HTTPException as exc:
         response = web.Response(status=exc.status, text=exc.text, content_type='text/plain')
-    except Exception:
-        # Do not log exception details: Playwright errors can contain typed secrets.
-        log.warning('Request failed; sensitive details suppressed')
+    except Exception as exc:
+        # Only the error class is safe to log; Playwright details can contain typed secrets.
+        log.warning('Request failed (%s); sensitive details suppressed', type(exc).__name__)
         response = web.json_response({'error': 'Action failed. Refresh the screenshot; try manual controls. If the browser closed, send /login again.'}, status=500)
     response.headers.update({
         'Cache-Control': 'no-store',

@@ -304,3 +304,24 @@ async def test_large_http_batch_and_fixed_extended_session(aiohttp_client, monke
     response = await client.post('/api/batch/start', headers=headers, json=body)
     assert response.status == 200 and s.expires == fixed_deadline
     await s.close_browser()
+
+
+@pytest.mark.asyncio
+async def test_login_helper_rejects_cookie_overlay_before_submit():
+    async with async_playwright() as pw:
+        browser=await pw.chromium.launch(args=['--no-sandbox'])
+        context=await browser.new_context()
+        await context.route('**/*',lambda route:route.fulfill(content_type='text/html',body=FIXTURE))
+        page=await context.new_page();await page.goto('https://elevenlabs.io/app/sign-in')
+        await page.evaluate('''() => {
+          const overlay=document.createElement('div');overlay.id='cookie-test';
+          overlay.style.cssText='position:fixed;inset:0;z-index:999;background:white';
+          const reject=document.createElement('button');reject.textContent='Reject all';
+          reject.onclick=()=>overlay.remove();overlay.append(reject);document.body.append(overlay);
+        }''')
+        s=module.State();s.page=page
+        row=Row('fixture@x.test','fixture-key')
+        await ElevenUI(s).login(row,'dummy-password')
+        await ElevenUI(s).authenticated()
+        assert row.login_attempted and await page.locator('#cookie-test').count()==0
+        await browser.close()
