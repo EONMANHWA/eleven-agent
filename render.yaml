@@ -10,13 +10,8 @@ services:
       - key: TELEGRAM_WEBHOOK_SECRET
         generateValue: true
       - key: ADMIN_CHAT_ID
-        value: "0"
-      - key: LOW_MEMORY_MODE
-        value: "1"
+        sync: false
+      - key: ELEVENLABS_FIREBASE_API_KEY
+        sync: false
       - key: MAX_BATCH_ACCOUNTS
         value: "100"
-      - key: BATCH_SESSION_MINUTES
-        value: "240"
-# Optional: add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Render after deploy.
-# Optional: NOPECHA_API_KEY. No reliable free access from Render is promised.
-# PUBLIC_BASE_URL is unnecessary on Render; the app uses RENDER_EXTERNAL_URL.

@@ -9,3 +9,5 @@ node_modules/
 *.zip
 
 elevenlabs-batch-keys*.csv
+elevenlabs-keys*.csv
+elevenlabs-http-test*.csv

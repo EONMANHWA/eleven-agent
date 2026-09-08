@@ -1,795 +1,489 @@
-"""Single-owner Telegram launcher for an ephemeral ElevenLabs browser.
-Never put credentials in Telegram. Run one instance / one Python worker only.
+"""Single-owner, Telegram-only ElevenLabs key collection. No browser or panel.
+One process/instance. Credentials and results are held in RAM only.
 """
 import asyncio
-import base64
 import contextlib
-import hashlib
 import hmac
-import ipaddress
-import logging
 import json
+import logging
 import os
-import re
 import secrets
-import signal
 import time
-from pathlib import Path
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import web
-from playwright.async_api import async_playwright, Error as BrowserError
 
-from resource_guard import chromium_args, unnecessary_request, watch_resources, memory_usage, LOW_MEMORY
+from eleven_http import ElevenClient, Row, PAUSE_STATUSES, csv_bytes, parse_emails
 
-from batch import Batch, KEY_RE, parse_emails, MAX_ACCOUNTS, MAX_EMAIL_TEXT_CHARS, BATCH_SESSION_MINUTES, BATCH_SESSION_SECONDS
-
-ROOT = Path(__file__).parent
-LOGIN_URL = 'https://elevenlabs.io/app/sign-in'
-KEYS_URL = 'https://elevenlabs.io/app/api/api-keys'
-WIDTH, HEIGHT = 1100, 780
 log = logging.getLogger('bot')
-SESSION_COOKIE = '__Host-panel_session'
+HELP = ('Telegram-only ElevenLabs bot — no browser or panel.\n\n'
+        '/batch — start: shared password, then emails\n'
+        '/run — review and approve collected emails\n'
+        '/status — progress\n/results — download current CSV\n'
+        '/resume — continue with the next queued account after a pause\n'
+        '/cancel — stop safely and clear the password\n'
+        '/forget — discard idle input and saved results\n\n'
+        'Each approved batch creates ONE NEW key per account; existing keys are not changed. '
+        'Use only accounts you own or are authorized to manage. '
+        'CAPTCHA, 2FA, and rate limits are not bypassed. '
+        'Bot chats are not end-to-end encrypted. Input deletion is best effort, '
+        'not a guarantee that all copies disappear. Results are sent here as private CSV files. '
+        'Free-host restarts clear RAM; download your results.')
 
 
-def digest(value):
-    return hashlib.sha256(value.encode()).hexdigest()
+@dataclass(repr=False)
+class Settings:
+    bot_token: str
+    webhook_secret: str
+    owner: int
+    firebase_key: str
+    public_url: str = ''
+    maximum: int = 100
+
+    @classmethod
+    def env(cls):
+        return cls(os.getenv('TELEGRAM_BOT_TOKEN', ''), os.getenv('TELEGRAM_WEBHOOK_SECRET', ''),
+                   int(os.getenv('ADMIN_CHAT_ID', '0')), os.getenv('ELEVENLABS_FIREBASE_API_KEY', ''),
+                   os.getenv('PUBLIC_BASE_URL') or os.getenv('RENDER_EXTERNAL_URL', ''),
+                   max(1, min(1000, int(os.getenv('MAX_BATCH_ACCOUNTS', '100')))))
+
+    def validate(self):
+        if not self.bot_token or len(self.webhook_secret) < 32 or self.owner <= 0 or not self.firebase_key:
+            raise RuntimeError('Required Telegram owner/secrets or Firebase public client configuration are missing.')
+        parsed = urlparse(self.public_url)
+        if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.query or parsed.fragment:
+            raise RuntimeError('PUBLIC_BASE_URL / RENDER_EXTERNAL_URL must be an HTTPS service URL.')
 
 
-class Problem(Exception):
-    pass
+@dataclass(repr=False)
+class Session:
+    mode: str = 'idle'
+    password: str = ''
+    emails: list = field(default_factory=list)
+    rows: list = field(default_factory=list)
+    nonce: str = ''
+    batch_id: str = ''
+    position: int = 0
+    delivered_keys: int = 0
+    touched: float = field(default_factory=time.monotonic)
+    stop: asyncio.Event = field(default_factory=asyncio.Event)
 
 
-class State:
-    def __init__(self):
-        self.http = None
-        self.pw = None
-        self.browser = None
-        self.context = None
-        self.page = None
+class Bot:
+    def __init__(self, settings, http):
+        self.settings, self.http = settings, http
+        self.client = ElevenClient(http, settings.firebase_key)
+        self.session = Session()
         self.lock = asyncio.Lock()
-        self.bot_lock = asyncio.Lock()
-        self.ticket = ''
-        self.ticket_until = 0
-        self.session = ''
-        self.expires = 0
-        self.session_started = time.monotonic()
-        self.last_action = 0
         self.seen = set()
-        self.batch = None
-        self.boot_id = secrets.token_hex(8)
-        self.browser_notice = ''
-        self.page_crashed = False
-        self.memory_recovering = False
-        self.memory = memory_usage()
-        self.saved_storage = None
-        self.saved_url = LOGIN_URL
-        self.last_checkpoint = 0
-        self.last_frame = None
-        self.frame_time = 0
-        self.cdp = None
-        self.browser_pid = None
+        self.worker = None
+        self.input_tasks = set()
+        self.progress_id = None
+        self.ready = False
+        self.shutting_down = False
 
-    def authorized(self, token):
-        now = time.monotonic()
-        return bool(token and self.session and hmac.compare_digest(digest(token), self.session)
-                    and now < self.expires and now - self.last_action < 600)
+    @property
+    def active(self):
+        return self.worker is not None and not self.worker.done()
 
-    async def close_browser(self):
-        self.session = ''
-        if self.batch:
-            await self.batch.halt(clear_password=True)
-            for row in self.batch.rows:
-                row.api_key = ''
-            self.batch = None
-        await self.dispose_browser()
-
-    async def dispose_browser(self):
-        # An account boundary clears all checkpoints, preventing cross-account restore.
-        self.saved_storage = None
-        self.saved_url = LOGIN_URL
-        self.last_frame = None
-        self.browser_notice = ''
-        await self.close_handles()
-
-    async def close_handles(self):
-        self.cdp = None
-        browser, context, pid = self.browser, self.context, self.browser_pid
-        self.context = self.browser = self.page = None
-        self.browser_pid = None
-        if browser:
-            try:
-                await asyncio.wait_for(browser.close(), timeout=3)
-            except Exception:
-                if isinstance(pid, int) and pid > 1 and pid != os.getpid():
-                    with contextlib.suppress(ProcessLookupError, PermissionError):
-                        os.kill(pid, signal.SIGKILL)
-        elif context:
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(context.close(), timeout=2)
-
-    async def open_browser(self, url=LOGIN_URL, restore=False):
-        if self.memory_recovering:
-            raise Problem('Memory protection is still stopping the browser. Try again shortly.')
-        storage = self.saved_storage if restore else None
-        if restore:
-            await self.close_handles()
-        else:
-            await self.dispose_browser()
-        self.last_frame = None
+    async def telegram(self, method, data=None, form=None):
         try:
-            self.browser = await self.pw.chromium.launch(headless=True, args=chromium_args())
-            try:
-                system = await self.browser.new_browser_cdp_session()
-                info = await asyncio.wait_for(system.send('SystemInfo.getProcessInfo'), timeout=2)
-                if isinstance(info, dict):
-                    self.browser_pid = next((int(p['id']) for p in info.get('processInfo', []) if p.get('type') == 'browser'), None)
-                await system.detach()
-            except Exception:
-                pass
-            self.context = await self.browser.new_context(viewport={'width': WIDTH, 'height': HEIGHT}, locale='en-US', accept_downloads=False, service_workers='block', storage_state=storage)
-            await self.context.route('**/*', block_local_network)
-            await self.context.grant_permissions(['clipboard-read', 'clipboard-write'], origin='https://elevenlabs.io')
-            self.page = await self.context.new_page()
-            self.page_crashed = False
-            current_page = self.page
-            def on_crash():
-                if self.page is current_page:
-                    self.page_crashed = True
-                    asyncio.create_task(self.pause_browser_for_memory('The browser tab crashed. The panel and collected results are retained. Use Restart browser; no password or key-creation request will be retried automatically.'))
-            self.page.on('crash', on_crash)
-            self.page.set_default_timeout(7000)
-            await self.page.goto(url, wait_until='domcontentloaded', timeout=60000)
-            self.browser_notice = ''
-            self.last_checkpoint = time.monotonic()
+            async with self.http.post('https://api.telegram.org/bot' + self.settings.bot_token + '/' + method,
+                                      json=data if form is None else None, data=form,
+                                      timeout=aiohttp.ClientTimeout(total=12), allow_redirects=False) as response:
+                result = await response.json()
+                if response.status == 200 and result.get('ok'):
+                    return result.get('result')
         except Exception:
-            await self.close_handles()
-            self.browser_notice = 'Browser did not start. The control-panel session is still available.'
-            raise Problem('Browser could not start or the site could not load. Your panel session is retained.')
+            pass  # No URL, token, payload, exception detail, or message content in logs.
+        return None
 
-    async def checkpoint_browser(self):
-        if not self.context or not self.page:
-            return
-        self.last_checkpoint = time.monotonic()
-        try:
-            parsed = urlparse(self.page.url)
-            if parsed.hostname == 'elevenlabs.io':
-                storage = await asyncio.wait_for(self.context.storage_state(indexed_db=True), timeout=2)
-                # Bound the recovery buffer; do not retain unexpectedly large site databases.
-                if len(json.dumps(storage)) <= 1024 * 1024:
-                    self.saved_storage = storage
-                    self.saved_url = 'https://elevenlabs.io' + (parsed.path or '/app/sign-in')
-        except Exception:
-            pass
+    async def say(self, text, **extra):
+        return await self.telegram('sendMessage', {'chat_id': self.settings.owner, 'text': text, **extra})
 
-    async def pause_browser_for_memory(self, reason=None):
-        if self.memory_recovering or not self.browser:
-            return
-        self.memory_recovering = True
-        self.browser_notice = reason or 'Browser paused to avoid exceeding the free server memory limit. The panel and collected results are retained. Use Restart browser; account login may need verification again.'
-        try:
-            if self.batch and self.batch.running:
-                await self.batch.halt()
-                self.batch.message = self.browser_notice
-                if self.batch.current:
-                    self.batch.current.message = self.browser_notice
-            log.warning('Browser safety pause; working set %d MB, limit %d MB', self.memory['working']//1024**2, self.memory['limit']//1024**2)
-            if not self.memory['limit'] or self.memory['working'] < self.memory['limit'] * .88:
-                await self.checkpoint_browser()
-            # Do not wait behind a stuck screenshot/page load while memory is critical.
-            await asyncio.wait_for(self.close_handles(), timeout=5)
-        except Exception:
-            pass
-        finally:
-            self.memory_recovering = False
+    async def delete_input(self, message):
+        deleted = await self.telegram('deleteMessage', {'chat_id': self.settings.owner,
+                                                        'message_id': message['message_id']})
+        if not deleted:
+            await self.say('I could not delete your input message. Please delete it manually if it contains private information.')
 
-    async def new_ticket(self):
-        # Requesting another link must not log out the account or erase batch results.
-        now = time.monotonic()
-        if self.session and (now >= self.expires or now-self.last_action >= 600):
-            await self.close_browser()
-        value = secrets.token_urlsafe(32)
-        self.ticket, self.ticket_until = digest(value), time.monotonic() + 300
-        return value
-
-
-@web.middleware
-async def guard(request, handler):
-    try:
-        if request.path.startswith('/api/') and request.method == 'POST':
-            if request.headers.get('Origin') != request.app['origin']:
-                raise web.HTTPForbidden(text='Invalid origin')
-            if request.content_type != 'application/json':
-                raise web.HTTPUnsupportedMediaType()
-        response = await handler(request)
-    except BrowserError as exc:
-        s = request.app['state']
-        code = 'browser_busy' if type(exc).__name__ == 'TimeoutError' else 'browser_unavailable'
-        response = web.json_response({'code':code,'error':s.browser_notice or 'The remote browser is busy or unavailable. Your panel session has not been cleared. Retry, or use Restart browser if needed.'},status=503)
-    except Problem as exc:
-        response = web.json_response({'error': str(exc)}, status=400)
-    except web.HTTPException as exc:
-        response = web.Response(status=exc.status, text=exc.text, content_type=exc.content_type)
-    except Exception as exc:
-        # Only the error class is safe to log; Playwright details can contain typed secrets.
-        log.warning('Request failed (%s); sensitive details suppressed', type(exc).__name__)
-        response = web.json_response({'error': 'Action failed. Refresh the screenshot; try manual controls. If the browser closed, send /login again.'}, status=500)
-    response.headers.update({
-        'Cache-Control': 'no-store',
-        'Referrer-Policy': 'no-referrer',
-        'X-Content-Type-Options': 'nosniff',
-        'X-Frame-Options': 'DENY',
-        'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
-        'Strict-Transport-Security': 'max-age=31536000',
-    })
-    return response
-
-
-async def telegram(app, method, payload):
-    async with app['state'].http.post(
-        f"https://api.telegram.org/bot{app['token']}/{method}", json=payload,
-        timeout=aiohttp.ClientTimeout(total=20),
-    ) as response:
-        data = await response.json()
-        if not data.get('ok'):
-            raise Problem('Telegram request failed. Check your bot settings in Render.')
-        return data['result']
-
-
-async def audit(app, event):
-    # Only fixed event names, never request bodies, browser state, or API keys.
-    url, key = os.getenv('SUPABASE_URL', '').rstrip('/'), os.getenv('SUPABASE_SERVICE_ROLE_KEY', '')
-    if not url or not key:
-        return
-    try:
-        async with app['state'].http.post(
-            url + '/rest/v1/bot_events',
-            headers={'apikey': key, 'Authorization': f'Bearer {key}', 'Prefer': 'return=minimal'},
-            json={'event': event}, timeout=aiohttp.ClientTimeout(total=5),
-        ) as response:
-            if response.status >= 300:
-                log.warning('Optional audit write failed')
-    except Exception:
-        log.warning('Optional audit unavailable')
-
-
-async def webhook(request):
-    app, s = request.app, request.app['state']
-    supplied = request.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
-    if not supplied or not hmac.compare_digest(supplied, app['webhook_secret']):
-        raise web.HTTPForbidden()
-    update = await request.json()
-    message = update.get('message') or {}
-    chat = message.get('chat') or {}
-    if chat.get('type') != 'private' or message.get('from', {}).get('is_bot'):
-        return web.json_response({'ok': True})
-    chat_id = chat.get('id')
-    if not isinstance(chat_id, int):
-        return web.json_response({'ok': True})
-    cmd = (message.get('text') or '').split(' ', 1)[0].split('@', 1)[0]
-    async with s.bot_lock:
-        uid = update.get('update_id')
-        if uid in s.seen:
-            return web.json_response({'ok': True})
-        if cmd == '/id':
-            text = f'Your private chat ID: {chat_id}\nSet ADMIN_CHAT_ID to this value in Render, then redeploy. Never send passwords to this bot.'
-        elif chat_id != app['admin']:
-            # Quietly ignore non-owners; /id is the sole public command.
-            return web.json_response({'ok': True})
-        elif cmd in ('/login', '/start', '/batch'):
-            async with s.lock:
-                ticket = await s.new_ticket()
-            link = app['origin'] + '/#' + ticket
-            await telegram(app, 'sendMessage', {
-                'chat_id': chat_id,
-                'text': 'Open your private panel within 5 minutes. An existing active account/batch is preserved. Anyone holding this one-use link can access it: do not forward it. Passwords and keys are NOT requested in this chat.\n\n' + link,
-                'link_preview_options': {'is_disabled': True},
-            })
-            await audit(app, 'session_link_created')
-            text = None
-        elif cmd == '/stop':
-            async with s.lock:
-                s.ticket = ''
-                await s.close_browser()
-            text = 'Browser closed and in-memory access revoked. A created ElevenLabs key remains valid until you revoke it in ElevenLabs.'
-        else:
-            text = '/login or /batch — open the private single-account/batch panel\n/stop — close it\n/id — show your chat ID\n\nDo not send passwords, verification codes, or API keys here.'
-        if text:
-            await telegram(app, 'sendMessage', {'chat_id': chat_id, 'text': text})
-        s.seen.add(uid)
-        if len(s.seen) > 1000:
-            s.seen = {uid}
-    return web.json_response({'ok': True})
-
-
-async def block_local_network(route):
-    parsed = urlparse(route.request.url)
-    host = (parsed.hostname or '').lower()
-    if parsed.scheme not in ('https', 'http'):
-        await route.abort()
-        return
-    if host == 'localhost' or host.endswith(('.localhost', '.local', '.internal')):
-        await route.abort()
-        return
-    try:
-        ip = ipaddress.ip_address(host)
-        if not ip.is_global:
-            await route.abort()
-            return
-    except ValueError:
-        pass
-    if unnecessary_request(host, route.request.resource_type):
-        await route.abort()
-        return
-    await route.continue_()
-
-
-async def claim(request):
-    app, s = request.app, request.app['state']
-    data = await request.json()
-    value = data.get('ticket', '')
-    if not isinstance(value, str) or len(value) > 100:
-        raise web.HTTPUnauthorized()
-    async with s.lock:
-        if not s.ticket or time.monotonic() >= s.ticket_until or not hmac.compare_digest(digest(value), s.ticket):
-            raise web.HTTPUnauthorized(text='Link expired or already used. Send /login again.')
-        s.ticket = ''  # Consume once before rotating panel access.
-        now = time.monotonic()
-        resume = bool(s.session and now < s.expires and now-s.last_action < 600)
-        if not resume:
-            await s.close_browser()
-            s.session_started = now
-            s.expires = now + 1200
-        token = s.boot_id + '.' + secrets.token_urlsafe(32)
-        s.session = digest(token)
-        s.last_action = time.monotonic()
-        if not resume:
-            try:
-                await s.open_browser()
-            except Problem:
-                pass  # Keep the authenticated panel available for retry/status/export.
-    await audit(app, 'browser_opened')
-    response = web.json_response({'token': token, **panel_metadata(s), 'resumed': resume})
-    attach_cookie(response, token, s)
-    return response
-
-
-def request_token(request):
-    header = request.headers.get('Authorization', '')
-    return header.removeprefix('Bearer ') if header.startswith('Bearer ') else request.cookies.get(SESSION_COOKIE, '')
-
-
-def attach_cookie(response, token, state):
-    response.set_cookie(SESSION_COOKIE, token, secure=True, httponly=True, samesite='Strict', path='/',
-                        max_age=max(1, int(state.expires-time.monotonic())))
-
-
-def authorize(request):
-    s = request.app['state']
-    token = request_token(request)
-    if not s.authorized(token):
-        if '.' in token and token.split('.', 1)[0] != s.boot_id:
-            message = 'The hosting server restarted and lost its temporary browser state. This is not a one-minute login timeout. Open a fresh /batch link; do not automatically repeat an uncertain key creation.'
-            code = 'server_restarted'
-        else:
-            message = 'Panel access expired or was replaced by a newer link. Open the latest /batch link.'
-            code = 'session_expired'
-        raise web.HTTPUnauthorized(text=json.dumps({'error': message, 'code': code}), content_type='application/json')
-
-
-def panel_metadata(s):
-    return {'solver_available': bool(os.getenv('NOPECHA_API_KEY')), 'max_accounts': MAX_ACCOUNTS,
-            'max_email_chars': MAX_EMAIL_TEXT_CHARS, 'batch_session_minutes': BATCH_SESSION_MINUTES,
-            'browser_notice': s.browser_notice, 'browser_open': s.page is not None and not s.page_crashed,
-            'browser_restore_available': s.saved_storage is not None, 'low_memory_mode': LOW_MEMORY,
-            'memory_working_mb': round(s.memory['working']/1024**2),
-            'memory_limit_mb': round(s.memory['limit']/1024**2),
-            'session_seconds_remaining': max(0, int(s.expires-time.monotonic())),
-            'idle_seconds_remaining': max(0, int(600-(time.monotonic()-s.last_action)))}
-
-
-async def resume_panel(request):
-    s = request.app['state']
-    authorize(request)
-    return web.json_response(panel_metadata(s))
-
-
-def eleven_page(page):
-    return urlparse(page.url).hostname == 'elevenlabs.io'
-
-
-async def screenshot(request):
-    s = request.app['state']
-    authorize(request)
-    if s.lock.locked():
-        if s.last_frame:
-            return web.Response(body=s.last_frame, content_type='image/jpeg', headers={'X-Frame-Stale':'1'})
-        return web.json_response({'error':'Browser operation in progress. Waiting for a frame.', 'code':'browser_busy'},status=503)
-    async with s.lock:
-        authorize(request)
-        if s.page is None:
-            if s.browser_notice:
-                return web.json_response({'error':s.browser_notice,'code':'browser_paused'},status=503)
-            return web.Response(status=204)
-        if s.last_frame and time.monotonic()-s.frame_time < 2:
-            return web.Response(body=s.last_frame, content_type='image/jpeg')
-        try:
-            if s.cdp is None:
-                s.cdp = await s.context.new_cdp_session(s.page)
-            shot = await asyncio.wait_for(s.cdp.send('Page.captureScreenshot', {
-                'format':'jpeg', 'quality':45, 'captureBeyondViewport':False, 'optimizeForSpeed':True,
-            }), timeout=4)
-            image = base64.b64decode(shot['data'])
-            s.last_frame, s.frame_time = image, time.monotonic()
-            return web.Response(body=image, content_type='image/jpeg')
-        except (BrowserError, asyncio.TimeoutError):
-            s.cdp = None
-            if s.last_frame:
-                return web.Response(body=s.last_frame, content_type='image/jpeg', headers={'X-Frame-Stale':'1'})
-            return web.json_response({'error':s.browser_notice or 'Browser is still rendering. Retrying automatically; the panel session is retained.', 'code':'browser_busy'}, status=503)
-
-
-async def click_named(page, pattern):
-    for role in ('button', 'link', 'tab'):
-        target = page.get_by_role(role, name=re.compile(pattern, re.I)).first
-        if await target.count() and await target.is_visible():
-            await target.click()
+    async def export(self, caption='Current results. Keep this CSV private.'):
+        s = self.session
+        if not s.rows:
+            await self.say('No results yet. Use /batch to begin.')
+            return False
+        content = csv_bytes(s.rows)
+        count = sum(bool(row.api_key) for row in s.rows)
+        form = aiohttp.FormData()
+        form.add_field('chat_id', str(self.settings.owner))
+        form.add_field('caption', caption[:1000])
+        form.add_field('document', content, filename=f'elevenlabs-keys-{s.batch_id}-{s.position}.csv', content_type='text/csv')
+        result = await self.telegram('sendDocument', form=form)
+        if result:
+            s.delivered_keys = max(s.delivered_keys, count)
             return True
-    return False
+        await self.say('CSV delivery failed. Results are still in RAM: use /results soon. Do not rerun the accounts to recover a file.')
+        return False
 
+    async def progress(self, text):
+        if self.progress_id:
+            result = await self.telegram('editMessageText', {'chat_id': self.settings.owner,
+                    'message_id': self.progress_id, 'text': text})
+            if result:
+                return
+        result = await self.say(text)
+        if isinstance(result, dict):
+            self.progress_id = result.get('message_id')
 
-async def nopecha_once(app):
-    """One visible static reCAPTCHA image-grid round; user reviews & verifies.
-    No interception of session cookies and no promises of CAPTCHA acceptance.
-    """
-    key = os.getenv('NOPECHA_API_KEY', '')
-    if not key:
-        raise Problem('No solver configured. Manual solving is free; NopeCHA free access excludes datacenter IPs such as Render.')
-    page = app['state'].page
-    frame = next((f for f in page.frames if '/recaptcha/' in f.url and '/bframe' in f.url), None)
-    if frame is None:
-        raise Problem('No supported visible reCAPTCHA grid. Solve manually. Turnstile, hCaptcha and other types are not integrated.')
-    table = frame.locator('.rc-imageselect-table-33, .rc-imageselect-table-44').first
-    task = frame.locator('.rc-imageselect-desc-wrapper').first
-    if not await table.count() or not await table.is_visible() or not await task.count():
-        raise Problem('Open the image challenge first, or use manual solving.')
-    cells = table.locator('td')
-    count = await cells.count()
-    if count not in (9, 16):
-        raise Problem('Unsupported grid; use manual solving.')
-    if await table.locator('.rc-imageselect-tileselected').count():
-        raise Problem('Start with an unselected grid, or continue solving manually.')
-    instruction = await task.inner_text()
-    if re.search(r'(once there are none|skip|fade away)', instruction, re.I):
-        raise Problem('Dynamic challenge: use manual solving. This integration supports static image grids only.')
-    image = base64.b64encode(await table.screenshot(type='png')).decode()
-    async with app['state'].http.post('https://api.nopecha.com/', json={
-        'key': key, 'type': 'recaptcha', 'task': instruction,
-        'grid': '3x3' if count == 9 else '4x4', 'image_data': [image],
-    }) as r:
-        result = await r.json()
-    job = result.get('data')
-    if result.get('error') or not isinstance(job, str):
-        raise Problem('Solver rejected the request. Check API access/credits. Manual solving is still available.')
-    for _ in range(20):
-        await asyncio.sleep(2)
-        async with app['state'].http.get('https://api.nopecha.com/', params={'key': key, 'id': job}) as r:
-            result = await r.json()
-        if result.get('error') == 14:
-            continue
-        choices = result.get('data')
-        if result.get('error') or not isinstance(choices, list) or len(choices) != count or not all(type(x) is bool for x in choices):
-            raise Problem('Solver did not return a valid grid. Continue manually.')
-        # Guard against stale results; don't click an image that changed meanwhile.
-        current = base64.b64encode(await table.screenshot(type='png')).decode()
-        if current != image:
-            raise Problem('Challenge changed during solving. No automated clicks made; continue manually.')
-        for i, selected in enumerate(choices):
-            if selected:
-                await cells.nth(i).click()
-        return 'Suggested squares selected. Review them in the screenshot, then click Verify yourself. Acceptance is not guaranteed.'
-    raise Problem('Solver timed out. Continue manually.')
+    def enqueue(self, update):
+        task = asyncio.create_task(self.handle(update))
+        self.input_tasks.add(task)
+        def done(finished):
+            self.input_tasks.discard(finished)
+            if not finished.cancelled() and finished.exception():
+                log.warning('Telegram update processing failed; details suppressed.')
+        task.add_done_callback(done)
 
-
-async def action(request):
-    app, s = request.app, request.app['state']
-    data = await request.json()
-    op = data.get('op')
-    async with s.lock:
-        authorize(request)
-        s.last_action = time.monotonic()
-        s.frame_time = 0
-        if s.batch and s.batch.running and op != 'close':
-            raise Problem('Pause the batch before using manual browser controls.')
-        if s.batch and op in ('login', 'signin', 'keys'):
-            raise Problem('Use the batch controls while a batch exists. Manual navigation can mix up account identity.')
-        p = s.page
-        if op == 'recover_browser':
-            await s.open_browser(s.saved_url, restore=True)
-            if s.batch and s.batch.current and s.batch.current.phase == 'open':
-                s.batch.current.phase = 'login'
-            return web.json_response({'message':'Browser restarted without resubmitting a password or creating another key. Inspect it before resuming.', **panel_metadata(s)})
-        if p is None and op != 'close':
-            raise Problem('No account browser is open. Start a batch or open a fresh /login session.')
-        message = 'Done. Review the browser below.'
-        if op == 'click':
-            x, y = float(data['x']), float(data['y'])
-            if not (0 <= x <= WIDTH and 0 <= y <= HEIGHT):
-                raise Problem('Click is outside the browser.')
-            await p.mouse.click(x, y)
-        elif op == 'type':
-            text = data.get('text', '')
-            if not isinstance(text, str) or not 0 < len(text) <= 2000:
-                raise Problem('Enter 1–2000 characters.')
-            if data.get('replace'):
-                await p.keyboard.press('ControlOrMeta+A')
-            await p.keyboard.insert_text(text)
-        elif op == 'key':
-            key = data.get('key')
-            if key not in ('Tab', 'Shift+Tab', 'Enter', 'Backspace', 'Escape', 'ArrowDown', 'ArrowUp'):
-                raise Problem('Unsupported keyboard control.')
-            await p.keyboard.press(key)
-        elif op == 'scroll':
-            await p.mouse.move(WIDTH // 2, HEIGHT // 2)
-            await p.mouse.wheel(0, max(-650, min(650, int(data.get('dy', 0)))))
-        elif op == 'login':
-            if not eleven_page(p):
-                raise Problem('Not on elevenlabs.io. Do not enter credentials here. Use the Sign-in page button.')
-            email, password = data.get('email', ''), data.get('password', '')
-            if not isinstance(email, str) or not isinstance(password, str) or not 0 < len(email) < 320 or not 0 < len(password) <= 2000:
-                raise Problem('Enter your email and password on this private page only.')
-            e = p.locator('input[type=email]').first
-            pw = p.locator('input[type=password]').first
-            if not await e.count() or not await pw.count():
-                raise Problem('Email/password form not visible. Choose email sign-in manually in the screenshot first.')
-            await e.fill(email)
-            await pw.fill(password)
-            if not await click_named(p, r'^(sign in|log in|continue)$'):
-                raise Problem('Fields filled; click the sign-in button manually below.')
-            message = 'Sign-in attempted, not yet verified. Complete any CAPTCHA or email verification below.'
-        elif op == 'signin':
-            await p.goto(LOGIN_URL, wait_until='domcontentloaded')
-        elif op == 'keys':
-            await p.goto(KEYS_URL, wait_until='domcontentloaded')
-            message = 'Review the page. If the URL has changed, use Developers → API Keys in the screenshot.'
-        elif op == 'clipboard':
-            if not eleven_page(p):
-                raise Problem('Only the ElevenLabs clipboard can be read.')
-            value = await p.evaluate('navigator.clipboard.readText()')
-            if not value or len(value) > 4096:
-                raise Problem('Clipboard is empty or too large. First click the key’s Copy button inside the browser screenshot.')
-            # Returned once; neither stored in application state nor logged.
-            await p.evaluate('navigator.clipboard.writeText("")')
-            return web.json_response({'clipboard': value, 'message': 'Remote clipboard copied below and cleared. Check that this is the newly created key before downloading.'})
-        elif op == 'solver':
-            if data.get('consent') is not True:
-                raise Problem('Explicit consent required to send CAPTCHA images to NopeCHA.')
-            message = await nopecha_once(app)
-        elif op == 'close':
-            await s.close_browser()
-            await audit(app, 'browser_closed')
-            response = web.json_response({'closed': True})
-            response.del_cookie(SESSION_COOKIE, path='/', secure=True, httponly=True, samesite='Strict')
-            return response
-        else:
-            raise Problem('Unknown action.')
-        current = p.url
-    return web.json_response({'message': message, 'url': current})
-
-
-async def batch_start(request):
-    s = request.app['state']
-    data = await request.json()
-    async with s.lock:
-        authorize(request)
-        if s.batch is not None:
-            raise Problem('Download and clear the existing batch before starting another.')
-        if data.get('authorize_full_access') is not True:
-            raise Problem('Explicit authorization for full-access key creation is required.')
-        if type(data.get('disable_leak_revocation', False)) is not bool:
-            raise Problem('Invalid leaked-key protection option.')
-        if data.get('disable_leak_revocation') and data.get('accept_leak_risk') is not True:
-            raise Problem('Confirm the separate risk warning before disabling leaked-key revocation.')
+    async def email_document(self, document):
+        if not str(document.get('file_name', '')).lower().endswith('.txt'):
+            raise ValueError('Upload a UTF-8 .txt file containing only emails, one per line.')
+        if not isinstance(document.get('file_size'), int) or not 0 < document['file_size'] <= 300000:
+            raise ValueError('The .txt file must be no larger than 300 KB.')
+        info = await self.telegram('getFile', {'file_id': document.get('file_id')})
+        path = info.get('file_path', '') if isinstance(info, dict) else ''
+        if not path or '..' in path or path.startswith('/') or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_/.-' for c in path):
+            raise ValueError('Could not safely download the email file. Paste emails in messages instead.')
         try:
-            emails = parse_emails(data.get('emails'))
-        except ValueError as exc:
-            raise Problem(str(exc))
-        password = data.get('password')
-        if not isinstance(password, str) or not 1 <= len(password) <= 2000:
-            raise Problem('Enter the shared password once on the private panel.')
-        # The worker destroys the current browser before logging into its first account.
-        s.batch = Batch(s, emails, password, data.get('disable_leak_revocation', False))
-        # Fixed ceiling measured from claim; a fresh batch cannot perpetually extend access.
-        s.expires = max(s.expires, s.session_started + BATCH_SESSION_SECONDS)
-        s.last_action = time.monotonic()
-        s.batch.launch()
-        result = s.batch.public()
-    response = web.json_response(result)
-    attach_cookie(response, request_token(request), s)
-    return response
+            async with self.http.get('https://api.telegram.org/file/bot' + self.settings.bot_token + '/' + path,
+                                     timeout=aiohttp.ClientTimeout(total=15), allow_redirects=False) as response:
+                if response.status != 200:
+                    raise ValueError('File download failed. Paste emails instead.')
+                data = bytearray()
+                async for chunk in response.content.iter_chunked(16384):
+                    data.extend(chunk)
+                    if len(data) > 300000:
+                        raise ValueError('File exceeds 300 KB.')
+                return data.decode('utf-8-sig')
+        except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError):
+            raise ValueError('Could not read the UTF-8 file. Paste plain emails instead.') from None
 
+    async def handle(self, update):
+        async with self.lock:
+            if self.shutting_down:
+                return
+            message = update.get('message')
+            callback = update.get('callback_query')
+            source = callback.get('message', {}) if isinstance(callback, dict) else message
+            sender = callback.get('from', {}) if isinstance(callback, dict) else (message or {}).get('from', {})
+            if not isinstance(source, dict):
+                return
+            chat = source.get('chat', {})
+            if chat.get('type') != 'private' or chat.get('id') != self.settings.owner or sender.get('id') != self.settings.owner:
+                return
+            update_id = update.get('update_id')
+            if not isinstance(update_id, int) or update_id in self.seen:
+                return
+            self.seen.add(update_id)
+            if len(self.seen) > 5000:
+                self.seen = set(sorted(self.seen)[-3000:])
+            s = self.session
+            s.touched = time.monotonic()
+            if callback:
+                await self.telegram('answerCallbackQuery', {'callback_query_id': callback.get('id')})
+                if s.mode != 'confirm' or callback.get('data') != 'approve:' + s.nonce:
+                    await self.say('This approval is expired or already used. Use /status or /batch.')
+                    return
+                s.nonce = ''
+                s.batch_id = secrets.token_hex(5)
+                s.rows = [Row(email, f'tg-{s.batch_id}-{index + 1:04d}') for index, email in enumerate(s.emails)]
+                s.mode = 'running'
+                await self.say('Approved: full access, leak auto-disable OFF. Processing sequentially. '
+                               'Each creation is attempted once. /cancel stops safely; /results downloads current results.')
+                self.worker = asyncio.create_task(self.run())
+                return
+            text = message.get('text', '')
+            stripped = text.strip()
+            command = stripped.split(maxsplit=1)[0].split('@')[0].lower() if stripped else ''
+            if command in ('/start', '/help'):
+                await self.say(HELP)
+                return
+            if command in ('/status',):
+                keys = sum(bool(r.api_key) for r in s.rows)
+                await self.say(f'State: {s.mode}. Emails collected: {len(s.emails)}/{self.settings.maximum}. '
+                               f'Accounts finished: {s.position}/{len(s.rows)}. Keys saved: {keys}.\n'
+                               'Password and results are RAM-only. /results downloads saved keys. '
+                               'After a pause, /resume processes ONLY the next queued account, not failed/uncertain rows.')
+                return
+            if command == '/results':
+                await self.export()
+                return
+            if command == '/cancel':
+                s.stop.set()
+                s.nonce = ''
+                if self.active:
+                    await self.say('Stopping after the current in-flight request finishes. A key already being created may still complete. Results will follow.')
+                else:
+                    s.password = ''
+                    s.mode = 'done' if s.rows else 'idle'
+                    for row in s.rows:
+                        if row.status == 'queued':
+                            row.status = 'cancelled'
+                    if s.rows:
+                        await self.export('Batch stopped. Password cleared from active state; saved results attached.')
+                    else:
+                        s.emails.clear()
+                    await self.say('Stopped. Shared password cleared from active state. /batch starts a new batch.')
+                return
+            if command == '/forget':
+                if self.active:
+                    await self.say('Use /cancel and wait for it to finish before /forget.')
+                    return
+                self.session = Session()
+                await self.say('Input and results discarded from active RAM state. This does not revoke keys or delete Telegram copies.')
+                return
+            if command in ('/batch', '/login'):
+                if self.active or s.mode == 'paused':
+                    await self.say('A batch is active or paused. Use /status, /resume, or /cancel first.')
+                    return
+                count = sum(bool(row.api_key) for row in s.rows)
+                if count > s.delivered_keys and not await self.export('Previous batch results, before starting a new batch.'):
+                    return
+                self.session = Session(mode='password')
+                await self.say('Send the ONE shared password as your next plain-text message (not here in a group). '
+                               'I will try to delete that message after reading it. If it looks like a bot command, send /password followed by a space and the password.\n\n'
+                               'Bot chats are not end-to-end encrypted; deletion cannot erase every copy. '
+                               'Only use accounts you own/control. No key will be created until you approve the batch. '
+                               'Input expires after 15 minutes of inactivity.')
+                return
+            if command in ('/resume', '/skip'):
+                if s.mode != 'paused' or self.active or not s.password:
+                    await self.say('No resumable batch. Use /status. After a restart or password expiry, start a new /batch for unprocessed emails only.')
+                    return
+                s.mode = 'running'
+                s.stop.clear()
+                await self.say('Continuing with the next queued email. Failed, blocked, and uncertain accounts will NOT be retried.')
+                self.worker = asyncio.create_task(self.run())
+                return
+            if command == '/run':
+                if s.mode not in ('emails', 'confirm') or not s.password or not s.emails:
+                    await self.say('First use /batch, send the password, and send at least one email.')
+                    return
+                s.mode = 'confirm'
+                s.nonce = secrets.token_urlsafe(12)
+                await self.say(f'Ready: {len(s.emails)} unique accounts.\n\n'
+                               'Approve ONE NEW unrestricted/full-access key per account, with leak auto-disable OFF. '
+                               'Leaked keys can remain usable until you revoke them; full access increases the damage a leak can cause. '
+                               'Plan limits and enforced workspace policies still apply. Existing keys will not be modified. '
+                               'Keys will be delivered here in a CSV.\n\n'
+                               'By approving, you confirm you own/control these accounts and accept these settings and Telegram delivery. '
+                               '/cancel stops without starting.', reply_markup={'inline_keyboard': [[
+                                   {'text': 'Approve full access + leak auto-disable OFF', 'callback_data': 'approve:' + s.nonce}]]})
+                return
+            if s.mode == 'password':
+                await self.delete_input(message)
+                password = text[len('/password '):] if text.startswith('/password ') else text
+                if not password or len(password) > 1024 or '\x00' in password:
+                    await self.say('Send a nonempty password of at most 1024 characters as text, not a file.')
+                    return
+                s.password = password
+                s.mode = 'emails'
+                await self.say(f'Password received. Send up to {self.settings.maximum} emails, one per line, '
+                               'in one or several messages, or upload a UTF-8 .txt file. '
+                               'Duplicates are removed. Send /run when finished. I will try to delete email input messages too.')
+                return
+            if s.mode in ('emails', 'confirm'):
+                try:
+                    if message.get('document'):
+                        try:
+                            text = await self.email_document(message['document'])
+                        finally:
+                            await self.delete_input(message)
+                    else:
+                        await self.delete_input(message)
+                    added = parse_emails(text, self.settings.maximum)
+                    merged = parse_emails('\n'.join(s.emails + added), self.settings.maximum)
+                    s.emails = merged
+                    s.mode, s.nonce = 'emails', ''
+                    await self.say(f'{len(s.emails)} unique emails collected. Send more, or /run to review and approve.')
+                except ValueError as exc:
+                    await self.say(str(exc))
+                return
+            # Unexpected private text might be a password. Delete rather than echo/store it.
+            if text or message.get('document'):
+                await self.delete_input(message)
+            await self.say('Use /batch to begin, /status for progress, or /help for instructions. No credentials were added.')
 
-async def batch_status(request):
-    s = request.app['state']
-    authorize(request)
-    # Snapshot contains no password/key. No lock wait during a long browser step.
-    snapshot = s.batch.public() if s.batch else {'mode': 'none', 'rows': []}
-    snapshot.update(panel_metadata(s))
-    snapshot['session_seconds_remaining'] = max(0, int(s.expires - time.monotonic()))
-    snapshot['idle_seconds_remaining'] = max(0, int(600 - (time.monotonic() - s.last_action)))
-    return web.json_response(snapshot)
-
-
-async def batch_control(request):
-    s = request.app['state']
-    data = await request.json()
-    async with s.lock:
-        authorize(request)
-        b = s.batch
-        if not b:
-            raise Problem('No batch exists.')
-        s.last_action = time.monotonic()
-        op = data.get('op')
-        if op == 'pause':
-            if b.mode in ('finished', 'cancelled'):
-                raise Problem('This batch has already ended.')
-            await b.halt()
-            b.message = 'Paused. Manual controls are available; Resume continues the current phase.'
-        elif op == 'resume':
-            if b.running:
-                raise Problem('Batch is already running.')
-            if data.get('confirm_identity') is True:
-                if not b.current or b.current.phase != 'identity' or data.get('expected_email') != b.current.email:
-                    raise Problem('Identity confirmation does not match the current row.')
-                b.current.identity = 'user_confirmed'
-            try:
-                b.launch()
-            except ValueError as exc:
-                raise Problem(str(exc))
-        elif op == 'skip':
-            if b.running or not b.current or b.mode in ('cancelled', 'finished'):
-                raise Problem('Pause an active row before skipping it.')
-            if data.get('confirm_skip') is not True:
-                raise Problem('Confirm skipping. A possibly created key will NOT be revoked.')
-            await b.halt()
-            row = b.current
-            row.status = 'skipped_possible_key' if row.submitted else 'skipped'
-            row.message = 'User skipped this row; any created key must be reviewed/revoked in ElevenLabs.'
-            row.phase = 'done'
-            await s.dispose_browser()
-            b.index += 1
-            b.launch()
-        elif op == 'capture':
-            if b.running or not b.current or b.mode in ('cancelled', 'finished'):
-                raise Problem('Pause the current row before manually collecting a copied key.')
-            row = b.current
-            if row.identity == 'not_verified':
-                raise Problem('Verify the signed-in account identity before collecting a key.')
-            if not s.page or not eleven_page(s.page):
-                raise Problem('No ElevenLabs account page is available.')
-            if data.get('confirm_manual_key') is not True:
-                raise Problem('Confirm the copied value is the newly created key for the current account.')
-            value = (await s.page.evaluate('navigator.clipboard.readText()')).strip()
-            if not KEY_RE.fullmatch(value):
-                raise Problem('Remote clipboard does not contain a recognized API key format.')
-            row.api_key = value
-            # A manual recovery does not assert the automatic submission produced this key.
-            row.settings = 'manual_settings_unverified'
-            row.status = 'collected_settings_unverified'
-            row.message = 'User collected a copied key. Requested permissions and leak protection were not verified automatically.'
-            row.phase = 'done'
-            await s.page.evaluate('navigator.clipboard.writeText("")')
-            await s.dispose_browser()
-            b.index += 1
-            b.launch()
-        elif op == 'cancel':
-            await b.halt(clear_password=True)
-            if b.current:
-                for row in b.rows[b.index:]:
+    async def run(self):
+        s = self.session
+        start = time.monotonic()
+        failures = 0
+        pause_note = ''
+        try:
+            while s.position < len(s.rows) and not s.stop.is_set():
+                row = s.rows[s.position]
+                await self.client.account(row, s.password, s.stop)
+                s.position += 1
+                failures = failures + 1 if row.status == 'login_rejected' else 0
+                if row.status != 'created_verified' or s.position == 1 or s.position % 5 == 0:
+                    await self.progress(f'{s.position}/{len(s.rows)} accounts finished. '
+                                        f'{sum(bool(r.api_key) for r in s.rows)} keys saved.\n'
+                                        f'Last account: {row.email}\nStatus: {row.status}\n{row.note}\n/results for the current CSV.')
+                if row.status in PAUSE_STATUSES or failures >= 3:
+                    s.mode = 'paused'
+                    pause_note = ('Verification, rate limit, uncertain outcome, or protocol error needs attention. '
+                                  'No browser will open and no failed account will be automatically retried.')
+                    break
+                if time.monotonic() - start >= 480 and s.position < len(s.rows):
+                    s.mode = 'paused'
+                    pause_note = 'Paused at the eight-minute work window to keep free-host runs bounded.'
+                    break
+                if s.position % 10 == 0 and s.position < len(s.rows):
+                    if not await self.export('Checkpoint: partial results. More accounts may still be running.'):
+                        s.mode = 'paused'
+                        pause_note = 'Paused because CSV delivery failed. Use /results before continuing.'
+                        break
+                if s.position < len(s.rows):
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(s.stop.wait(), timeout=1)
+        except asyncio.CancelledError:
+            s.stop.set()
+            pause_note = 'Host shutdown interrupted the batch. Review uncertain rows before starting any new batch.'
+        except Exception:
+            s.stop.set()
+            pause_note = 'Batch stopped after an internal error; no automatic retry. Check saved results.'
+            log.warning('Batch stopped; sensitive error details suppressed.')
+        finally:
+            if s.stop.is_set():
+                s.mode = 'done'
+                for row in s.rows:
                     if row.status == 'queued':
                         row.status = 'cancelled'
-            b.message = 'Cancelled. Shared password cleared; collected results remain until you clear/close the session.'
-            await s.dispose_browser()
-        elif op == 'clear':
-            if b.running or data.get('confirm_clear') is not True:
-                raise Problem('Stop the batch and confirm you saved the results before clearing.')
-            await b.halt(clear_password=True)
-            for row in b.rows:
-                row.api_key = ''
-            s.batch = None
-            await s.dispose_browser()
-            return web.json_response({'mode': 'none', 'rows': []})
-        else:
-            raise Problem('Unknown batch control.')
-        return web.json_response(b.public())
+            elif s.position >= len(s.rows):
+                s.mode = 'done'
+            if s.mode != 'paused':
+                s.password = ''
+            s.touched = time.monotonic()
+            await self.export('Partial results: batch paused.' if s.mode == 'paused' else 'Batch results. Shared password cleared from active state.')
+            await self.say((f'Paused after {s.position}/{len(s.rows)} accounts. {pause_note}\n'
+                            'Use /resume ONLY to move to the next queued email, /results to save keys, or /cancel. '
+                            'The password expires after 15 minutes of inactivity.') if s.mode == 'paused' else
+                           (f'Finished/stopped: {s.position}/{len(s.rows)} accounts processed, '
+                            f'{sum(bool(r.api_key) for r in s.rows)} keys saved. {pause_note}\n'
+                            'Download the CSV. /batch creates a new batch; never blindly rerun uncertain accounts.'))
 
+    async def housekeeping(self):
+        while True:
+            await asyncio.sleep(30)
+            async with self.lock:
+                s = self.session
+                idle = time.monotonic() - s.touched
+                if not self.active and s.password and idle > 900:
+                    s.password = ''
+                    s.nonce = ''
+                    s.mode = 'done' if s.rows else 'idle'
+                    for row in s.rows:
+                        if row.status == 'queued':
+                            row.status = 'not_processed_password_expired'
+                    if s.rows:
+                        await self.export('Input expired. Password cleared; unprocessed accounts were not attempted.')
+                    else:
+                        s.emails.clear()
+                    await self.say('Shared password expired and was cleared from active state. Start /batch again for unprocessed emails only.')
+                if not self.active and idle > 3600:
+                    self.session = Session()
 
-async def batch_export(request):
-    s = request.app['state']
-    authorize(request)
-    if not s.batch:
-        raise Problem('No batch results exist.')
-    return web.Response(text=s.batch.csv(), content_type='text/csv',
-                        headers={'Content-Disposition': 'attachment; filename="elevenlabs-batch-keys.csv"'})
-
-
-async def cleanup_loop(app):
-    s = app['state']
-    while True:
-        await asyncio.sleep(30)
-        async with s.lock:
-            now = time.monotonic()
-            if s.session and (now >= s.expires or now - s.last_action >= 600):
-                await s.close_browser()
-
-
-async def lifecycle(app):
-    s = app['state']
-    s.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-    s.pw = await async_playwright().start()
-    sweeper = asyncio.create_task(cleanup_loop(app))
-    watchdog = asyncio.create_task(watch_resources(app))
-    async def register():
-        for delay in (0, 5, 15, 30, 60):
-            await asyncio.sleep(delay)
-            try:
-                await telegram(app, 'setWebhook', {'url': app['origin'] + '/telegram/webhook', 'secret_token': app['webhook_secret'], 'allowed_updates': ['message'], 'max_connections': 1})
-                log.info('Telegram webhook registered')
+    async def register(self):
+        commands = [{'command': name, 'description': desc} for name, desc in [
+            ('batch', 'Start a Telegram-only batch'), ('run', 'Review emails and approve'),
+            ('status', 'Check progress'), ('results', 'Download current keys CSV'),
+            ('resume', 'Continue with next queued account'), ('cancel', 'Stop safely'),
+            ('forget', 'Discard idle RAM data'), ('help', 'Instructions and privacy')]]
+        while not self.shutting_down:
+            result = await self.telegram('setWebhook', {'url': self.settings.public_url.rstrip('/') + '/telegram',
+                'secret_token': self.settings.webhook_secret, 'allowed_updates': ['message', 'callback_query'],
+                'max_connections': 1, 'drop_pending_updates': False})
+            if result:
+                self.ready = True
+                await self.telegram('setMyCommands', {'commands': commands})
+                await self.telegram('setMyDescription', {'description': 'Private, owner-only ElevenLabs key manager. Telegram-only input and CSV results; no browser. Use /batch.'})
                 return
-            except Exception:
-                log.warning('Webhook registration failed; check Render bot token and public URL')
-    registration = asyncio.create_task(register())
-    yield
-    for task in (registration, sweeper, watchdog):
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-    await s.close_browser()
-    await s.pw.stop()
-    await s.http.close()
+            log.warning('Webhook registration not ready; retrying without logging credentials.')
+            await asyncio.sleep(20)
 
 
-def create_app():
-    app = web.Application(middlewares=[guard], client_max_size=2 * 1024 * 1024)
-    app['origin'] = os.getenv('PUBLIC_BASE_URL', os.getenv('RENDER_EXTERNAL_URL', '')).rstrip('/')
-    app['token'] = os.getenv('TELEGRAM_BOT_TOKEN', '')
-    app['webhook_secret'] = os.getenv('TELEGRAM_WEBHOOK_SECRET', '')
-    app['admin'] = int(os.getenv('ADMIN_CHAT_ID', '0'))
-    app['state'] = State()
+BOT_KEY = web.AppKey('bot', Bot)
+
+
+def create_app(bot):
+    app = web.Application(client_max_size=1024 * 1024)
+    app[BOT_KEY] = bot
+
     async def health(request):
+        return web.json_response({'ok': True, 'mode': 'telegram-http', 'browser': False, 'webhook_ready': bot.ready})
+
+    async def root(request):
+        return web.Response(text='Telegram-only bot. No browser or control panel. Open your Telegram bot and send /batch.\n')
+
+    async def webhook(request):
+        supplied = request.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
+        if not supplied or not hmac.compare_digest(supplied.encode(), bot.settings.webhook_secret.encode()):
+            raise web.HTTPForbidden()
+        if bot.shutting_down:
+            raise web.HTTPServiceUnavailable()
+        try:
+            update = await request.json()
+        except (ValueError, UnicodeError):
+            raise web.HTTPBadRequest() from None
+        if not isinstance(update, dict):
+            raise web.HTTPBadRequest()
+        # Acknowledge immediately; never keep the webhook open for account processing.
+        bot.enqueue(update)
         return web.json_response({'ok': True})
-    async def asset(request):
-        name = request.match_info.get('name') or 'index.html'
-        if name not in ('index.html', 'app.js', 'style.css'):
-            raise web.HTTPNotFound()
-        content_type = {'index.html': 'text/html', 'app.js': 'application/javascript', 'style.css': 'text/css'}[name]
-        return web.Response(text=(ROOT / 'web' / name).read_text(), content_type=content_type)
+
+    app.router.add_get('/', root)
     app.router.add_get('/health', health)
-    app.router.add_get('/', asset)
-    app.router.add_get('/assets/{name}', asset)
-    app.router.add_post('/telegram/webhook', webhook)
-    app.router.add_post('/api/claim', claim)
-    app.router.add_get('/api/screenshot', screenshot)
-    app.router.add_get('/api/session', resume_panel)
-    app.router.add_post('/api/action', action)
-    app.router.add_post('/api/batch/start', batch_start)
-    app.router.add_post('/api/batch/control', batch_control)
-    app.router.add_get('/api/batch/status', batch_status)
-    app.router.add_post('/api/batch/export', batch_export)
-    app.cleanup_ctx.append(lifecycle)
+    app.router.add_post('/telegram', webhook)
     return app
 
 
+def main():
+    settings = Settings.env()
+    settings.validate()
+
+    async def factory():
+        http = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=8), trust_env=False)
+        bot = Bot(settings, http)
+        app = create_app(bot)
+        house = asyncio.create_task(bot.housekeeping())
+        registration = asyncio.create_task(bot.register())
+
+        async def shutdown(app):
+            bot.shutting_down = True
+            house.cancel()
+            registration.cancel()
+            bot.session.stop.set()
+            for task in list(bot.input_tasks):
+                task.cancel()
+            await asyncio.gather(*bot.input_tasks, return_exceptions=True)
+            if bot.active:
+                try:
+                    await asyncio.wait_for(asyncio.shield(bot.worker), timeout=22)
+                except asyncio.TimeoutError:
+                    bot.worker.cancel()
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(bot.worker, timeout=5)
+            bot.session.password = ''
+            await asyncio.gather(house, registration, return_exceptions=True)
+            await http.close()
+        app.on_cleanup.append(shutdown)
+        return app
+
+    logging.basicConfig(level=logging.WARNING, format='%(levelname)s %(name)s: %(message)s')
+    web.run_app(factory(), host='0.0.0.0', port=int(os.getenv('PORT', '10000')), access_log=None,
+                print=None, shutdown_timeout=5)
+
+
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-    # Access logs disabled, including URLs carrying Telegram's bot token.
-    app = create_app()
-    if not re.fullmatch(r'\d+:[A-Za-z0-9_-]+', app['token']):
-        raise SystemExit('Set TELEGRAM_BOT_TOKEN in Render environment settings.')
-    if not re.fullmatch(r'[A-Za-z0-9_-]{32,256}', app['webhook_secret']):
-        raise SystemExit('Set TELEGRAM_WEBHOOK_SECRET to 32–256 random URL-safe characters.')
-    parsed = urlparse(app['origin'])
-    if parsed.scheme != 'https' or not parsed.hostname or parsed.path not in ('', '/') or parsed.query or parsed.fragment or parsed.username:
-        raise SystemExit('PUBLIC_BASE_URL / RENDER_EXTERNAL_URL must be a public HTTPS origin, without a path.')
-    web.run_app(app, host='0.0.0.0', port=int(os.getenv('PORT', '10000')), access_log=None)
+    main()
