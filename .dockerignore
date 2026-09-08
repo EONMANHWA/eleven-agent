@@ -1,0 +1,11 @@
+.git
+.env
+*.env
+__pycache__
+.pytest_cache
+.venv
+tests
+*.zip
+*.log
+
+elevenlabs-batch-keys*.csv
