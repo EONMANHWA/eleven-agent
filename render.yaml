@@ -11,6 +11,8 @@ services:
         generateValue: true
       - key: ADMIN_CHAT_ID
         value: "0"
+      - key: LOW_MEMORY_MODE
+        value: "1"
       - key: MAX_BATCH_ACCOUNTS
         value: "100"
       - key: BATCH_SESSION_MINUTES

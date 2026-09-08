@@ -8,16 +8,20 @@ import hashlib
 import hmac
 import ipaddress
 import logging
+import json
 import os
 import re
 import secrets
+import signal
 import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import web
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Error as BrowserError
+
+from resource_guard import chromium_args, unnecessary_request, watch_resources, memory_usage, LOW_MEMORY
 
 from batch import Batch, KEY_RE, parse_emails, MAX_ACCOUNTS, MAX_EMAIL_TEXT_CHARS, BATCH_SESSION_MINUTES, BATCH_SESSION_SECONDS
 
@@ -26,6 +30,7 @@ LOGIN_URL = 'https://elevenlabs.io/app/sign-in'
 KEYS_URL = 'https://elevenlabs.io/app/api/api-keys'
 WIDTH, HEIGHT = 1100, 780
 log = logging.getLogger('bot')
+SESSION_COOKIE = '__Host-panel_session'
 
 
 def digest(value):
@@ -53,6 +58,18 @@ class State:
         self.last_action = 0
         self.seen = set()
         self.batch = None
+        self.boot_id = secrets.token_hex(8)
+        self.browser_notice = ''
+        self.page_crashed = False
+        self.memory_recovering = False
+        self.memory = memory_usage()
+        self.saved_storage = None
+        self.saved_url = LOGIN_URL
+        self.last_checkpoint = 0
+        self.last_frame = None
+        self.frame_time = 0
+        self.cdp = None
+        self.browser_pid = None
 
     def authorized(self, token):
         now = time.monotonic()
@@ -69,31 +86,109 @@ class State:
         await self.dispose_browser()
 
     async def dispose_browser(self):
-        # Destroy only the current account browser; keep the panel/batch session.
-        if self.context:
-            with contextlib.suppress(Exception):
-                await self.context.close()
-        if self.browser:
-            with contextlib.suppress(Exception):
-                await self.browser.close()
-        self.context = self.browser = self.page = None
+        # An account boundary clears all checkpoints, preventing cross-account restore.
+        self.saved_storage = None
+        self.saved_url = LOGIN_URL
+        self.last_frame = None
+        self.browser_notice = ''
+        await self.close_handles()
 
-    async def open_browser(self, url=LOGIN_URL):
-        await self.dispose_browser()
+    async def close_handles(self):
+        self.cdp = None
+        browser, context, pid = self.browser, self.context, self.browser_pid
+        self.context = self.browser = self.page = None
+        self.browser_pid = None
+        if browser:
+            try:
+                await asyncio.wait_for(browser.close(), timeout=3)
+            except Exception:
+                if isinstance(pid, int) and pid > 1 and pid != os.getpid():
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.kill(pid, signal.SIGKILL)
+        elif context:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(context.close(), timeout=2)
+
+    async def open_browser(self, url=LOGIN_URL, restore=False):
+        if self.memory_recovering:
+            raise Problem('Memory protection is still stopping the browser. Try again shortly.')
+        storage = self.saved_storage if restore else None
+        if restore:
+            await self.close_handles()
+        else:
+            await self.dispose_browser()
+        self.last_frame = None
         try:
-            self.browser = await self.pw.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
-            self.context = await self.browser.new_context(viewport={'width': WIDTH, 'height': HEIGHT}, locale='en-US', accept_downloads=False, service_workers='block')
+            self.browser = await self.pw.chromium.launch(headless=True, args=chromium_args())
+            try:
+                system = await self.browser.new_browser_cdp_session()
+                info = await asyncio.wait_for(system.send('SystemInfo.getProcessInfo'), timeout=2)
+                if isinstance(info, dict):
+                    self.browser_pid = next((int(p['id']) for p in info.get('processInfo', []) if p.get('type') == 'browser'), None)
+                await system.detach()
+            except Exception:
+                pass
+            self.context = await self.browser.new_context(viewport={'width': WIDTH, 'height': HEIGHT}, locale='en-US', accept_downloads=False, service_workers='block', storage_state=storage)
             await self.context.route('**/*', block_local_network)
             await self.context.grant_permissions(['clipboard-read', 'clipboard-write'], origin='https://elevenlabs.io')
             self.page = await self.context.new_page()
+            self.page_crashed = False
+            current_page = self.page
+            def on_crash():
+                if self.page is current_page:
+                    self.page_crashed = True
+                    asyncio.create_task(self.pause_browser_for_memory('The browser tab crashed. The panel and collected results are retained. Use Restart browser; no password or key-creation request will be retried automatically.'))
+            self.page.on('crash', on_crash)
             self.page.set_default_timeout(7000)
             await self.page.goto(url, wait_until='domcontentloaded', timeout=60000)
+            self.browser_notice = ''
+            self.last_checkpoint = time.monotonic()
         except Exception:
-            await self.dispose_browser()
-            raise Problem('Browser could not start or the site could not load. Render may need more memory.')
+            await self.close_handles()
+            self.browser_notice = 'Browser did not start. The control-panel session is still available.'
+            raise Problem('Browser could not start or the site could not load. Your panel session is retained.')
+
+    async def checkpoint_browser(self):
+        if not self.context or not self.page:
+            return
+        self.last_checkpoint = time.monotonic()
+        try:
+            parsed = urlparse(self.page.url)
+            if parsed.hostname == 'elevenlabs.io':
+                storage = await asyncio.wait_for(self.context.storage_state(indexed_db=True), timeout=2)
+                # Bound the recovery buffer; do not retain unexpectedly large site databases.
+                if len(json.dumps(storage)) <= 1024 * 1024:
+                    self.saved_storage = storage
+                    self.saved_url = 'https://elevenlabs.io' + (parsed.path or '/app/sign-in')
+        except Exception:
+            pass
+
+    async def pause_browser_for_memory(self, reason=None):
+        if self.memory_recovering or not self.browser:
+            return
+        self.memory_recovering = True
+        self.browser_notice = reason or 'Browser paused to avoid exceeding the free server memory limit. The panel and collected results are retained. Use Restart browser; account login may need verification again.'
+        try:
+            if self.batch and self.batch.running:
+                await self.batch.halt()
+                self.batch.message = self.browser_notice
+                if self.batch.current:
+                    self.batch.current.message = self.browser_notice
+            log.warning('Browser safety pause; working set %d MB, limit %d MB', self.memory['working']//1024**2, self.memory['limit']//1024**2)
+            if not self.memory['limit'] or self.memory['working'] < self.memory['limit'] * .88:
+                await self.checkpoint_browser()
+            # Do not wait behind a stuck screenshot/page load while memory is critical.
+            await asyncio.wait_for(self.close_handles(), timeout=5)
+        except Exception:
+            pass
+        finally:
+            self.memory_recovering = False
 
     async def new_ticket(self):
-        await self.close_browser()
+        # Requesting another link must not log out the account or erase batch results.
+        now = time.monotonic()
+        if self.session and (now >= self.expires or now-self.last_action >= 600):
+            await self.close_browser()
         value = secrets.token_urlsafe(32)
         self.ticket, self.ticket_until = digest(value), time.monotonic() + 300
         return value
@@ -108,10 +203,14 @@ async def guard(request, handler):
             if request.content_type != 'application/json':
                 raise web.HTTPUnsupportedMediaType()
         response = await handler(request)
+    except BrowserError as exc:
+        s = request.app['state']
+        code = 'browser_busy' if type(exc).__name__ == 'TimeoutError' else 'browser_unavailable'
+        response = web.json_response({'code':code,'error':s.browser_notice or 'The remote browser is busy or unavailable. Your panel session has not been cleared. Retry, or use Restart browser if needed.'},status=503)
     except Problem as exc:
         response = web.json_response({'error': str(exc)}, status=400)
     except web.HTTPException as exc:
-        response = web.Response(status=exc.status, text=exc.text, content_type='text/plain')
+        response = web.Response(status=exc.status, text=exc.text, content_type=exc.content_type)
     except Exception as exc:
         # Only the error class is safe to log; Playwright details can contain typed secrets.
         log.warning('Request failed (%s); sensitive details suppressed', type(exc).__name__)
@@ -184,7 +283,7 @@ async def webhook(request):
             link = app['origin'] + '/#' + ticket
             await telegram(app, 'sendMessage', {
                 'chat_id': chat_id,
-                'text': 'Open your private browser within 5 minutes. Anyone holding this link can use it: do not forward it. Use your normal browser if Telegram cannot open the page. Passwords and keys are NOT requested in this chat.\n\n' + link,
+                'text': 'Open your private panel within 5 minutes. An existing active account/batch is preserved. Anyone holding this one-use link can access it: do not forward it. Passwords and keys are NOT requested in this chat.\n\n' + link,
                 'link_preview_options': {'is_disabled': True},
             })
             await audit(app, 'session_link_created')
@@ -220,6 +319,9 @@ async def block_local_network(route):
             return
     except ValueError:
         pass
+    if unnecessary_request(host, route.request.resource_type):
+        await route.abort()
+        return
     await route.continue_()
 
 
@@ -232,27 +334,65 @@ async def claim(request):
     async with s.lock:
         if not s.ticket or time.monotonic() >= s.ticket_until or not hmac.compare_digest(digest(value), s.ticket):
             raise web.HTTPUnauthorized(text='Link expired or already used. Send /login again.')
-        s.ticket = ''  # One use, before doing expensive browser work.
-        try:
-            await s.open_browser()
-        except Exception:
+        s.ticket = ''  # Consume once before rotating panel access.
+        now = time.monotonic()
+        resume = bool(s.session and now < s.expires and now-s.last_action < 600)
+        if not resume:
             await s.close_browser()
-            raise Problem('Browser could not start or ElevenLabs could not load. Try /login again. Render may need more memory.')
-        token = secrets.token_urlsafe(32)
+            s.session_started = now
+            s.expires = now + 1200
+        token = s.boot_id + '.' + secrets.token_urlsafe(32)
         s.session = digest(token)
-        s.session_started = time.monotonic()
-        s.expires = s.session_started + 1200
         s.last_action = time.monotonic()
+        if not resume:
+            try:
+                await s.open_browser()
+            except Problem:
+                pass  # Keep the authenticated panel available for retry/status/export.
     await audit(app, 'browser_opened')
-    return web.json_response({'token': token, 'solver_available': bool(os.getenv('NOPECHA_API_KEY')),
-                              'max_accounts': MAX_ACCOUNTS, 'max_email_chars': MAX_EMAIL_TEXT_CHARS,
-                              'batch_session_minutes': BATCH_SESSION_MINUTES})
+    response = web.json_response({'token': token, **panel_metadata(s), 'resumed': resume})
+    attach_cookie(response, token, s)
+    return response
+
+
+def request_token(request):
+    header = request.headers.get('Authorization', '')
+    return header.removeprefix('Bearer ') if header.startswith('Bearer ') else request.cookies.get(SESSION_COOKIE, '')
+
+
+def attach_cookie(response, token, state):
+    response.set_cookie(SESSION_COOKIE, token, secure=True, httponly=True, samesite='Strict', path='/',
+                        max_age=max(1, int(state.expires-time.monotonic())))
 
 
 def authorize(request):
-    token = request.headers.get('Authorization', '').removeprefix('Bearer ')
-    if not request.app['state'].authorized(token):
-        raise web.HTTPUnauthorized(text='Session expired. Send /login again.')
+    s = request.app['state']
+    token = request_token(request)
+    if not s.authorized(token):
+        if '.' in token and token.split('.', 1)[0] != s.boot_id:
+            message = 'The hosting server restarted and lost its temporary browser state. This is not a one-minute login timeout. Open a fresh /batch link; do not automatically repeat an uncertain key creation.'
+            code = 'server_restarted'
+        else:
+            message = 'Panel access expired or was replaced by a newer link. Open the latest /batch link.'
+            code = 'session_expired'
+        raise web.HTTPUnauthorized(text=json.dumps({'error': message, 'code': code}), content_type='application/json')
+
+
+def panel_metadata(s):
+    return {'solver_available': bool(os.getenv('NOPECHA_API_KEY')), 'max_accounts': MAX_ACCOUNTS,
+            'max_email_chars': MAX_EMAIL_TEXT_CHARS, 'batch_session_minutes': BATCH_SESSION_MINUTES,
+            'browser_notice': s.browser_notice, 'browser_open': s.page is not None and not s.page_crashed,
+            'browser_restore_available': s.saved_storage is not None, 'low_memory_mode': LOW_MEMORY,
+            'memory_working_mb': round(s.memory['working']/1024**2),
+            'memory_limit_mb': round(s.memory['limit']/1024**2),
+            'session_seconds_remaining': max(0, int(s.expires-time.monotonic())),
+            'idle_seconds_remaining': max(0, int(600-(time.monotonic()-s.last_action)))}
+
+
+async def resume_panel(request):
+    s = request.app['state']
+    authorize(request)
+    return web.json_response(panel_metadata(s))
 
 
 def eleven_page(page):
@@ -261,12 +401,33 @@ def eleven_page(page):
 
 async def screenshot(request):
     s = request.app['state']
+    authorize(request)
+    if s.lock.locked():
+        if s.last_frame:
+            return web.Response(body=s.last_frame, content_type='image/jpeg', headers={'X-Frame-Stale':'1'})
+        return web.json_response({'error':'Browser operation in progress. Waiting for a frame.', 'code':'browser_busy'},status=503)
     async with s.lock:
         authorize(request)
         if s.page is None:
+            if s.browser_notice:
+                return web.json_response({'error':s.browser_notice,'code':'browser_paused'},status=503)
             return web.Response(status=204)
-        image = await s.page.screenshot(type='jpeg', quality=65, timeout=12000)
-    return web.Response(body=image, content_type='image/jpeg')
+        if s.last_frame and time.monotonic()-s.frame_time < 2:
+            return web.Response(body=s.last_frame, content_type='image/jpeg')
+        try:
+            if s.cdp is None:
+                s.cdp = await s.context.new_cdp_session(s.page)
+            shot = await asyncio.wait_for(s.cdp.send('Page.captureScreenshot', {
+                'format':'jpeg', 'quality':45, 'captureBeyondViewport':False, 'optimizeForSpeed':True,
+            }), timeout=4)
+            image = base64.b64decode(shot['data'])
+            s.last_frame, s.frame_time = image, time.monotonic()
+            return web.Response(body=image, content_type='image/jpeg')
+        except (BrowserError, asyncio.TimeoutError):
+            s.cdp = None
+            if s.last_frame:
+                return web.Response(body=s.last_frame, content_type='image/jpeg', headers={'X-Frame-Stale':'1'})
+            return web.json_response({'error':s.browser_notice or 'Browser is still rendering. Retrying automatically; the panel session is retained.', 'code':'browser_busy'}, status=503)
 
 
 async def click_named(page, pattern):
@@ -338,11 +499,17 @@ async def action(request):
     async with s.lock:
         authorize(request)
         s.last_action = time.monotonic()
+        s.frame_time = 0
         if s.batch and s.batch.running and op != 'close':
             raise Problem('Pause the batch before using manual browser controls.')
         if s.batch and op in ('login', 'signin', 'keys'):
             raise Problem('Use the batch controls while a batch exists. Manual navigation can mix up account identity.')
         p = s.page
+        if op == 'recover_browser':
+            await s.open_browser(s.saved_url, restore=True)
+            if s.batch and s.batch.current and s.batch.current.phase == 'open':
+                s.batch.current.phase = 'login'
+            return web.json_response({'message':'Browser restarted without resubmitting a password or creating another key. Inspect it before resuming.', **panel_metadata(s)})
         if p is None and op != 'close':
             raise Problem('No account browser is open. Start a batch or open a fresh /login session.')
         message = 'Done. Review the browser below.'
@@ -402,7 +569,9 @@ async def action(request):
         elif op == 'close':
             await s.close_browser()
             await audit(app, 'browser_closed')
-            return web.json_response({'closed': True})
+            response = web.json_response({'closed': True})
+            response.del_cookie(SESSION_COOKIE, path='/', secure=True, httponly=True, samesite='Strict')
+            return response
         else:
             raise Problem('Unknown action.')
         current = p.url
@@ -436,7 +605,9 @@ async def batch_start(request):
         s.last_action = time.monotonic()
         s.batch.launch()
         result = s.batch.public()
-    return web.json_response(result)
+    response = web.json_response(result)
+    attach_cookie(response, request_token(request), s)
+    return response
 
 
 async def batch_status(request):
@@ -444,6 +615,7 @@ async def batch_status(request):
     authorize(request)
     # Snapshot contains no password/key. No lock wait during a long browser step.
     snapshot = s.batch.public() if s.batch else {'mode': 'none', 'rows': []}
+    snapshot.update(panel_metadata(s))
     snapshot['session_seconds_remaining'] = max(0, int(s.expires - time.monotonic()))
     snapshot['idle_seconds_remaining'] = max(0, int(600 - (time.monotonic() - s.last_action)))
     return web.json_response(snapshot)
@@ -557,6 +729,7 @@ async def lifecycle(app):
     s.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
     s.pw = await async_playwright().start()
     sweeper = asyncio.create_task(cleanup_loop(app))
+    watchdog = asyncio.create_task(watch_resources(app))
     async def register():
         for delay in (0, 5, 15, 30, 60):
             await asyncio.sleep(delay)
@@ -568,7 +741,7 @@ async def lifecycle(app):
                 log.warning('Webhook registration failed; check Render bot token and public URL')
     registration = asyncio.create_task(register())
     yield
-    for task in (registration, sweeper):
+    for task in (registration, sweeper, watchdog):
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -598,6 +771,7 @@ def create_app():
     app.router.add_post('/telegram/webhook', webhook)
     app.router.add_post('/api/claim', claim)
     app.router.add_get('/api/screenshot', screenshot)
+    app.router.add_get('/api/session', resume_panel)
     app.router.add_post('/api/action', action)
     app.router.add_post('/api/batch/start', batch_start)
     app.router.add_post('/api/batch/control', batch_control)

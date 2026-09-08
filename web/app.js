@@ -2,6 +2,28 @@
 const $ = id => document.getElementById(id);
 let ticket = location.hash.slice(1), token = '', busy = false, imageBusy = false, objectUrl = '', timer;
 let batchSnapshot = null, batchBusy = false, batchPolling = false;
+let browserInfo = {}, lastScreenshotAt = 0, frameStale = false;
+const authHeaders = () => token && token !== '@cookie' ? {'Authorization':'Bearer '+token} : {};
+function browserStatus(text) { $('browserStatus').textContent = text; }
+function updateBrowser(data) {
+  if(typeof data.browser_open === 'boolean') browserInfo = {...browserInfo,...data};
+  if(data.browser_notice) browserStatus(data.browser_notice);
+  else if(data.browser_open === false) browserStatus('No account browser is open. You can start a batch or use Restart browser.');
+}
+function disconnected(message) {
+  token=''; clearInterval(timer); frameStale=true;
+  for(const id of ['password','text','batchPassword']) $(id).value='';
+  $('welcome').hidden=false; $('connect').disabled=true;
+  // Preserve already displayed values so the user can save them; do not fake continued access.
+  document.querySelectorAll('#workspace button').forEach(b=>{
+    if(!['reveal','copy','download','clear'].includes(b.id)) b.disabled=true;
+  });
+  status(message); browserStatus('Disconnected. Previously displayed data is read-only. Request a new /batch link.');
+}
+async function errorFrom(response, fallback) {
+  try { const body=await response.json();return body.error || fallback; } catch { return fallback; }
+}
+
 history.replaceState(null, '', location.pathname); // Never keep the capability in history or request URLs.
 $('connect').disabled = !ticket;
 const status = text => { $('status').textContent = text; };
@@ -15,27 +37,38 @@ function finish() {
   $('workspace').hidden = true; $('welcome').hidden = false; $('connect').disabled = true;
 }
 async function api(path, body) {
-  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json', ...(token ? {'Authorization':'Bearer '+token} : {})}, body:JSON.stringify(body), cache:'no-store'});
-  if (r.status === 401) { finish(); throw Error('Session or link expired. Send /login to the bot again.'); }
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json', ...authHeaders()}, body:JSON.stringify(body), cache:'no-store'});
+  if (r.status === 401) { const message=await errorFrom(r,'Session or link expired. Open the latest /batch link.'); disconnected(message); throw Error(message); }
   const text = await r.text(); let data;
   try { data = JSON.parse(text); } catch { throw Error('Server unavailable or waking up. Wait, then get a fresh /login link.'); }
   if (!r.ok) throw Error(data.error || 'Request failed.');
   return data;
 }
-async function refresh() {
+async function refresh(force=false) {
   if (!token || imageBusy || busy) return;
-  imageBusy = true;
+  const interval=batchSnapshot?.mode==='running'?10000:5000;
+  if(!force && (document.hidden || performance.now()-lastScreenshotAt<interval)) return;
+  imageBusy = true; lastScreenshotAt=performance.now();
   try {
-    const r = await fetch('/api/screenshot', {headers:{'Authorization':'Bearer '+token}, cache:'no-store'});
-    if (r.status === 401) { finish(); throw Error('Session expired. Send /login again.'); }
+    const r = await fetch('/api/screenshot', {headers:authHeaders(), cache:'no-store'});
+    if (r.status === 401) { const message=await errorFrom(r,'Panel access expired.'); disconnected(message); return; }
     if (r.status === 204) { $('screen').removeAttribute('src'); return; }
-    if (!r.ok) throw Error('Screenshot unavailable. Retry Refresh; if necessary, use /login again.');
+    if (!r.ok) {
+      frameStale=true;
+      browserStatus(await errorFrom(r,'The browser is busy. Retrying screenshots automatically; this does not clear your session.'));
+      return;
+    }
     const blob = await r.blob(); if (!token) return;
     const next = URL.createObjectURL(blob); const old = objectUrl;
     $('screen').src = next; objectUrl = next;
     if (old) URL.revokeObjectURL(old);
-  } catch(e) { status(e.message); } finally { imageBusy = false; }
+    frameStale = r.headers.get('X-Frame-Stale') === '1';
+    if(frameStale) browserStatus('Showing the previous frame while the browser is busy. Waiting for a fresh frame; the session is retained.');
+    else if(!browserInfo.browser_notice) browserStatus('Browser frame updated.');
+  } catch(e) { frameStale=true; browserStatus('Connection interrupted. Retrying without clearing the panel.'); }
+  finally { imageBusy = false; }
 }
+
 async function run(body) {
   if (busy || !token) return;
   if (batchSnapshot?.mode === 'running' && body.op !== 'close') { status('Pause the batch before using manual browser controls.'); return; }
@@ -43,32 +76,39 @@ async function run(body) {
   try {
     const data = await api('/api/action', body);
     if (data.closed) { finish(); status('Session closed. Revoke unwanted keys in ElevenLabs separately.'); return; }
+    updateBrowser(data);
     if (data.url) $('remoteUrl').textContent = data.url;
     if ('clipboard' in data) { $('key').value = data.clipboard; $('keybox').hidden = false; }
     status(data.message || 'Done.');
   } catch(e) { status(e.message); }
-  finally { busy = false; await refresh(); }
+  finally { busy = false; await refresh(true); }
+}
+function activatePanel(data) {
+  token=data.token || '@cookie';
+  $('welcome').hidden=true; $('workspace').hidden=false;
+  const maxAccounts=data.max_accounts || 100;
+  $('batchLimitSummary').textContent='Up to '+maxAccounts+' accounts.';
+  $('batchLimitLabel').textContent='maximum '+maxAccounts;
+  $('batchEmails').maxLength=data.max_email_chars || 26000;
+  $('sessionLimits').textContent='Single-account sessions last 20 minutes. A batch extends the fixed maximum to '+(data.batch_session_minutes || 240)+' minutes from opening the session. A page refresh can reconnect while that server session is alive.';
+  $('solver').disabled=!data.solver_available;
+  $('solverStatus').textContent=data.solver_available?'Solver API configured; credits may be used.':'No solver API configured. Manual solving is available.';
+  updateBrowser(data);
+  status(data.resumed?'Reconnected to the existing panel. Your account/batch was not reset.':'Panel ready. Browser loading may take a little time on free hosting.');
+  clearInterval(timer);timer=setInterval(()=>{pollBatch();refresh();},3000);
+  pollBatch();
 }
 $('connect').onclick = async () => {
   if (!ticket || busy) return; busy = true; $('connect').disabled = true;
   status('Starting the private browser. This may take a minute…');
   try {
-    const data = await api('/api/claim', {ticket}); ticket = ''; token = data.token;
-    $('welcome').hidden = true; $('workspace').hidden = false;
-    const maxAccounts = data.max_accounts || 100;
-    $('batchLimitSummary').textContent = 'Up to '+maxAccounts+' accounts.';
-    $('batchLimitLabel').textContent = 'maximum '+maxAccounts;
-    $('batchEmails').maxLength = data.max_email_chars || 26000;
-    $('sessionLimits').textContent = 'Single-account sessions last 20 minutes. Starting a batch extends the maximum window to '+(data.batch_session_minutes || 240)+' minutes from opening this session.';
-    $('solver').disabled = !data.solver_available;
-    $('solverStatus').textContent = data.solver_available ? 'An API key is configured on your server. A request may use paid credits.' : 'No API key configured. Solve manually or set NOPECHA_API_KEY in Render.';
-    status('Browser ready. Review the screenshot, then sign in.');
-    timer = setInterval(() => { pollBatch(); refresh(); }, 3000);
+    const data = await api('/api/claim', {ticket}); ticket = '';
+    activatePanel(data);
   } catch(e) { ticket = ''; status(e.message + ' Request a new /login link to retry.'); }
-  finally { busy = false; await refresh(); }
+  finally { busy = false; await refresh(true); }
 };
 $('screen').onclick = e => {
-  if (!token || busy) return;
+  if (!token || busy || imageBusy || frameStale || browserInfo.browser_open === false) return;
   const rect = e.target.getBoundingClientRect();
   run({op:'click', x:(e.clientX-rect.left)*1100/rect.width, y:(e.clientY-rect.top)*780/rect.height});
 };
@@ -85,7 +125,10 @@ $('typing').onsubmit = e => {
 document.querySelectorAll('[data-op]').forEach(b => b.onclick = () => run({op:b.dataset.op}));
 document.querySelectorAll('[data-key]').forEach(b => b.onclick = () => run({op:'key',key:b.dataset.key}));
 document.querySelectorAll('[data-scroll]').forEach(b => b.onclick = () => run({op:'scroll',dy:Number(b.dataset.scroll)}));
-$('refresh').onclick = refresh;
+$('refresh').onclick = () => refresh(true);
+$('restartBrowser').onclick = () => {
+  if(confirm('Restart only the remote browser? The panel and collected batch results remain. If a new key is visible but not saved, save it first. No password or Create Key request will be repeated automatically.')) run({op:'recover_browser'});
+};
 $('solver').onclick = () => { if(!$('consent').checked) { status('Consent is required before sending the CAPTCHA image to NopeCHA.'); return; } run({op:'solver',consent:true}); };
 $('reveal').onclick = () => $('key').type = $('key').type === 'password' ? 'text' : 'password';
 $('clear').onclick = clearValue;
@@ -110,6 +153,7 @@ window.addEventListener('pagehide', () => { clearValue(); $('password').value=''
 function renderBatch(data) {
   const previousEmail = batchSnapshot?.rows?.[batchSnapshot?.current_index]?.email;
   batchSnapshot = data;
+  updateBrowser(data);
   const exists = data.mode !== 'none';
   const running = data.mode === 'running';
   const terminal = ['finished','cancelled'].includes(data.mode);
@@ -144,8 +188,8 @@ async function pollBatch() {
   if(!token || batchPolling || batchBusy) return;
   batchPolling = true;
   try {
-    const r = await fetch('/api/batch/status',{headers:{'Authorization':'Bearer '+token},cache:'no-store'});
-    if(r.status === 401) { finish(); status('Session expired. In-memory results cannot be recovered after cleanup.'); return; }
+    const r = await fetch('/api/batch/status',{headers:authHeaders(),cache:'no-store'});
+    if(r.status === 401) { disconnected(await errorFrom(r,'The server session is no longer available.')); return; }
     if(!r.ok) return;
     const data=await r.json(); if(token) renderBatch(data);
   } catch { /* transient wake-up/network failures do not replace the account status */ }
@@ -194,11 +238,34 @@ $('captureBatch').onclick = () => {
 $('exportBatch').onclick = async () => {
   if(!token) return;
   try {
-    const r=await fetch('/api/batch/export',{method:'POST',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},body:'{}',cache:'no-store'});
-    if(r.status === 401) { finish(); throw Error('Session expired.'); }
+    const r=await fetch('/api/batch/export',{method:'POST',headers:{...authHeaders(),'Content-Type':'application/json'},body:'{}',cache:'no-store'});
+    if(r.status === 401) { const message=await errorFrom(r,'Session expired.'); disconnected(message); throw Error(message); }
     if(!r.ok) throw Error('Could not download batch results. Try again before closing.');
     const blob=await r.blob(); const url=URL.createObjectURL(blob);
     const a=document.createElement('a'); a.href=url; a.download='elevenlabs-batch-keys.csv'; a.click(); setTimeout(()=>URL.revokeObjectURL(url),1000);
     status('Downloaded a plaintext CSV containing collected keys. Store it securely; passwords are not included.');
   } catch(e) { status(e.message); }
 };
+
+
+// A page refresh/in-app-browser reload must not destroy the live server session.
+if(!ticket) {
+  (async()=>{
+    try {
+      const r=await fetch('/api/session',{cache:'no-store',credentials:'same-origin'});
+      if(!r.ok) return;
+      const data=await r.json();
+      activatePanel({...data,resumed:true});
+      await refresh(true);
+    } catch { /* A fresh visitor still needs an owner-only Telegram link. */ }
+  })();
+}
+
+window.addEventListener('hashchange',()=>{
+  const incoming=location.hash.slice(1);
+  if(!incoming) return;
+  history.replaceState(null,'',location.pathname);
+  ticket=incoming;clearInterval(timer);
+  $('welcome').hidden=false;$('workspace').hidden=true;$('connect').disabled=false;
+  status('New private link received. Open it to reconnect; the server account is not reset by issuing a link.');
+});

@@ -126,3 +126,47 @@ async def test_batch_panel_shared_password_once_and_private_download():
             await page.locator('#exportBatch').click()
         assert (await download.value).suggested_filename=='elevenlabs-batch-keys.csv'
         await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_cookie_reconnect_and_screenshot_retry_without_logout():
+    async with async_playwright() as pw:
+        browser=await pw.chromium.launch(args=['--no-sandbox'])
+        page=await browser.new_page()
+        fixture=await browser.new_page();await fixture.set_content('<h1>Fixture browser frame</h1>')
+        image=await fixture.screenshot(type='jpeg');await fixture.close()
+        screenshots=0; resumes=0
+        async def handler(route):
+            nonlocal screenshots,resumes
+            url=route.request.url
+            if url.endswith('/api/claim'):
+                return await route.fulfill(json={'token':'dummy-session','solver_available':False,'browser_open':True},
+                  headers={'Set-Cookie':'__Host-panel_session=dummy-session; Path=/; Secure; HttpOnly; SameSite=Strict'})
+            if url.endswith('/api/session'):
+                assert '__Host-panel_session=dummy-session' in route.request.headers.get('cookie','')
+                resumes+=1
+                return await route.fulfill(json={'solver_available':False,'browser_open':True})
+            if url.endswith('/api/batch/status'):
+                return await route.fulfill(json={'mode':'none','rows':[],'browser_open':True})
+            if url.endswith('/api/screenshot'):
+                screenshots+=1
+                if screenshots==1:
+                    return await route.fulfill(status=503,json={'error':'Browser is rendering; panel retained.','code':'browser_busy'})
+                return await route.fulfill(content_type='image/jpeg',body=image)
+            if '/assets/' in url:
+                name=url.rsplit('/',1)[1]
+                return await route.fulfill(content_type='text/css' if name.endswith('.css') else 'application/javascript',body=(ROOT/'web'/name).read_text())
+            return await route.fulfill(content_type='text/html',body=(ROOT/'web/index.html').read_text())
+        await page.route('https://bot.example/**',handler)
+        await page.goto('https://bot.example/#one-use-ticket')
+        await page.locator('#connect').click()
+        await page.wait_for_function('document.getElementById("browserStatus").textContent.includes("panel retained")')
+        assert await page.locator('#workspace').is_visible()
+        await page.locator('#refresh').click()
+        await page.wait_for_function('document.getElementById("screen").naturalWidth > 0')
+        await page.reload()
+        await page.locator('#workspace').wait_for(state='visible')
+        assert resumes==1
+        assert 'Reconnected' in await page.locator('#status').inner_text()
+        assert await page.evaluate('localStorage.length+sessionStorage.length')==0
+        await browser.close()

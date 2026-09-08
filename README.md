@@ -48,7 +48,7 @@ The default is **not** a promise that 100 real accounts will complete within fou
 
 The 10-minute inactivity limit remains: successful worker steps and manual control actions count as activity, but screenshots and status polling do not. The panel displays remaining absolute and idle time. **A completed or paused batch can expire after 10 minutes without an action, even with hours left on the absolute clock.** Download partial results regularly and save the final file promptly. There is no durable restart/resume or background notification when a batch finishes.
 
-Passwords and keys are only held temporarily by the application. A restart, deployment, session expiration, `/stop`, or new session can discard results. Enabling the optional Supabase audit log does **not** make queues or keys durable. For long batches, a suitably sized paid Render instance is more reliable than relying on free-tier browser workloads; it still does not prevent all restarts or website blocks.
+Passwords and keys are only held temporarily by the application. A restart, deployment, session expiration, `/stop`, or an expired/restarted session can discard results. Enabling the optional Supabase audit log does **not** make queues or keys durable. For long batches, a suitably sized paid Render instance is more reliable than relying on free-tier browser workloads; it still does not prevent all restarts or website blocks.
 
 ### Is Supabase compulsory?
 
@@ -77,7 +77,7 @@ A GitHub PAT authorizes GitHub operations, **not Render deployment**. Render nee
 5. If paused, inspect the live screenshot below. Finish any CAPTCHA/verification, then click **Resume**. If the identity prompt is shown, inspect the profile email and check the exact-account confirmation first. The bot does not automatically retry a rejected password.
 6. **Pause** stops the runner after the current browser operation releases its lock. Manual controls cannot race a running batch. If a key-creation form cannot be handled automatically, either skip that account or finish the form manually; copy the new key using its Copy button **inside the remote screenshot**, then choose **Collect copied key & continue**. This records the settings as unverified.
 7. Download **results CSV** while running, paused, or finished. Only keys already collected at download time are included. Save the final CSV before closing the session.
-8. **Cancel batch** clears the shared password and closes the current browser but keeps previously collected results available. Cancelled batches cannot resume. **Clear batch**, `/stop`, a new `/login`/`/batch`, session expiry, or a Render restart discards the in-memory results. Download first.
+8. **Cancel batch** clears the shared password and closes the current browser but keeps previously collected results available. Cancelled batches cannot resume. **Clear batch**, `/stop`, session expiry or a Render restart discards the in-memory results. Download first.
 
 **Skip and Cancel do not revoke keys.** A possibly created but not-yet-copied key may be lost when its browser closes. Inspect/copy it before skipping or cancelling. A skipped ambiguous submission is reported as `skipped_possible_key`, not as a clean failure.
 
@@ -188,7 +188,7 @@ Only that private chat can launch or stop a browser or batch. Group chats are ig
 
 | Command | Result |
 |---|---|
-| `/start`, `/login` or `/batch` | Clear the old session/results and issue a new single-use link |
+| `/start`, `/login` or `/batch` | Issue a new one-use link; preserve an existing live account/batch |
 | `/stop` | Close the browser and revoke pending/in-memory access |
 | `/id` | Show the caller’s private chat ID |
 
@@ -231,9 +231,9 @@ Downloaded `.env` files are **plaintext secrets**. Do not send them to this chat
 - This is a single-owner personal tool, **not a production-hardened multi-user login service**.
 - The private panel is clearly labeled as self-hosted, not official ElevenLabs. Render processes credential input and browser state, so use only hosting you control and trust. HTTPS is transport encryption, not end-to-end encrypted remote computing.
 - Telegram bot chats are not end-to-end encrypted. They contain a short-lived access link, not account credentials or the resulting API key. Someone who steals that link before use can claim the session.
-- Ticket and session tokens are kept as hashes in application memory. The session bearer token stays in the panel’s JavaScript memory, not localStorage. Reloading the panel requires a new `/login` link.
-- Single-account sessions have a 20-minute maximum. Starting a batch extends the fixed maximum to **240 minutes (4 hours) from opening the private session** by default; starting another batch in the same panel does not reset that deadline. The **10-minute inactivity limit still applies**, including while paused or after completion. Successful batch steps count as activity; automatic screenshots/status polls do not. `/login` or `/batch` invalidates the previous session and discards its batch/results.
-- The app does not deliberately persist browser profiles or screenshots, and closes the temporary Chromium profile on normal shutdown. Chromium may use temporary server files; this is **not a guarantee of RAM-only processing or forensic erasure**. Abrupt crashes may leave temporary files until Render replaces the filesystem.
+- Ticket and session tokens are kept as hashes in application memory. The session bearer token stays in the panel’s JavaScript memory, not localStorage. An HttpOnly, Secure, SameSite=Strict cookie allows a refreshed panel to reattach to the same live server session. Credentials and keys are not saved in localStorage or sessionStorage.
+- Single-account sessions have a 20-minute maximum. Starting a batch extends the fixed maximum to **240 minutes (4 hours) from opening the private session** by default; starting another batch in the same panel does not reset that deadline. The **10-minute inactivity limit still applies**, including while paused or after completion. Successful batch steps count as activity; automatic screenshots/status polls do not. `/login` or `/batch` now issues a reconnection link without discarding the active browser/batch. Claiming it rotates panel authorization, so an older tab may need refreshing. Use `/stop` to explicitly clear the session.
+- The app keeps one recent frame and a bounded, best-effort cookies/localStorage/IndexedDB checkpoint in server RAM, never in the database or a file. A page refresh can reconnect using the panel cookie; a browser-only restart can try the checkpoint without repeating a password or key-creation submission. It clears checkpoints at account boundaries. The app does not deliberately persist browser profiles or screenshots, and closes the temporary Chromium profile on normal shutdown. Chromium may use temporary server files; this is **not a guarantee of RAM-only processing or forensic erasure**. Abrupt crashes may leave temporary files until Render replaces the filesystem.
 - Access logs and detailed exception messages are disabled in this app to avoid leaking secrets. Hosting infrastructure can still collect its own metadata. Do not enable browser tracing, request-body logging, analytics, or session recording.
 - The panel uses same-origin requests, authorization headers, explicit POST-origin checks, no external scripts, and anti-framing headers. Open it as a top-level page; embedding is intentionally blocked.
 - Chromium runs as a non-root container user but with `--no-sandbox` for hosting compatibility. Basic private-IP URL blocking is **not a complete network sandbox or DNS-rebinding defense**. Do not host this container alongside sensitive internal services or unrelated secrets. Keep dependencies patched.
@@ -256,9 +256,25 @@ Downloaded `.env` files are **plaintext secrets**. Do not send them to this chat
 | Phone verification required | Use your existing recovery options or contact ElevenLabs support; a CAPTCHA service cannot replace the factor. |
 | Session disappears on restart | Expected: sessions are deliberately not persisted in Supabase. Start again with `/login`. |
 
+## Reliability repair for 512 MB hosting
+
+Render logs confirmed out-of-memory kills at the free service's 512 MB limit. Those restarts destroyed in-memory sessions; they were not caused by a one-minute login timeout. The first deployment's short sign-in-page test did not catch sustained memory use.
+
+The repair keeps the free plan and adds:
+
+- Lower-memory Chromium options, bounded JS heap, reduced Node driver heap, and blocking of optional tracking scripts/application fonts. Authentication, CAPTCHA scripts/images/fonts, and application images remain available.
+- Direct browser screenshot capture without waiting for web fonts. A busy screenshot returns a cached frame or a retryable response instead of resetting panel access. Automatic captures are less frequent, especially during batch processing.
+- An HttpOnly session cookie for reconnecting after an ordinary panel refresh. Fresh Telegram links preserve an existing live account/batch rather than immediately closing it.
+- A cgroup working-set monitor that attempts to pause/close the browser at 80% of the host limit while retaining the panel and collected results. It can restore a bounded RAM-only login checkpoint through **Restart browser (keep panel)** when one is available.
+- Distinct messages for a browser pause, temporary screenshot failure, expired access, and a complete hosting-server restart. No password or key-creation submission is retried automatically during recovery.
+
+**Limits:** This is best-effort resource management, not additional RAM. A sudden allocation can exceed the limit before the safeguard runs. A full Render restart still loses server memory, including checkpoints, passwords and collected keys. A browser checkpoint is not guaranteed to restore authentication or a newly created key's one-time reveal dialog. Save keys/results before restarting a live browser. Do not assume an authenticated dashboard or 100-account run fits in 512 MB.
+
+If memory protection pauses the browser, keep the panel open, download collected results, and try **Restart browser (keep panel)**. If the same account page repeatedly triggers it, that workload needs a larger host or a normal browser; repeatedly restarting it is not a reliable fix.
+
 ## Tests and verification
 
-The current suite has **29 passing tests**. Added checks accept 100 emails through both validation and the HTTP endpoint, reject 101 under the default configuration, exercise maximum-length addresses, validate configurable bounds, and check that the extended session deadline cannot be reset by starting another batch. Checks cover Python/JavaScript syntax, webhook authentication, owner allowlisting, duplicate updates, link replay protection, expiry/revocation, origin checks, bounded email lists, explicit risk consents, password cleanup, secret-free status responses, CSV formula-injection protection, identity pauses, and no duplicate Create after an ambiguous submission. Real Chromium tests exercise login, both permission choices, the leak-protection switch, key capture, and two fresh isolated account browsers against intercepted fixture pages. Frontend tests cover entering one shared password, acknowledgement requirements, clearing credential fields and downloading results. These fixtures are not the authenticated ElevenLabs site.
+The current suite has **36 passing tests**. Added checks accept 100 emails through both validation and the HTTP endpoint, reject 101 under the default configuration, exercise maximum-length addresses, validate configurable bounds, and check that the extended session deadline cannot be reset by starting another batch. Checks cover Python/JavaScript syntax, webhook authentication, owner allowlisting, duplicate updates, link replay protection, expiry/revocation, origin checks, bounded email lists, explicit risk consents, password cleanup, secret-free status responses, CSV formula-injection protection, identity pauses, and no duplicate Create after an ambiguous submission. Real Chromium tests exercise login, both permission choices, the leak-protection switch, key capture, and two fresh isolated account browsers against intercepted fixture pages. Frontend tests cover entering one shared password, acknowledgement requirements, clearing credential fields and downloading results. These fixtures are not the authenticated ElevenLabs site.
 
 Run in a development environment:
 

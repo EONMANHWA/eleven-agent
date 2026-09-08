@@ -80,7 +80,7 @@ async def test_expiry_and_revocation(client):
     assert not s.authorized('test-session')
     auth_session(client)
     first = await s.new_ticket()
-    assert not s.authorized('test-session')
+    assert s.authorized('test-session')  # Issuing a link no longer destroys a live session.
     assert s.ticket == module.digest(first)
     second = await s.new_ticket()
     assert first != second
@@ -131,6 +131,7 @@ async def test_ticket_claim_once_with_mock_browser(client):
     s = client.app['state']
     page = AsyncMock()
     page.set_default_timeout = lambda _: None
+    page.on = lambda *args: None
     context = AsyncMock()
     context.new_page.return_value = page
     browser = AsyncMock()
