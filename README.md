@@ -8,15 +8,16 @@ Owner-only Telegram bot for accounts you own or are authorized to manage. It sig
 
 1. Open your Telegram bot and send `/batch`.
 2. Send the shared password as the next plain-text message. If the password looks like a command, send `/password ` followed by the password instead.
-3. Send emails one per line. You can use several messages or upload a UTF-8 `.txt` file (maximum 300 KB). Duplicate emails are removed. Default limit: **100** unique accounts.
-4. Send `/run`, read the risk notice, then tap **Approve full access + leak auto-disable OFF**.
+3. **Forward your existing channel posts into the private bot chat**, or paste any text containing emails. Headings and surrounding sentences are fine. The bot extracts addresses from text, captions, and explicit email/URL link targets. You can also upload a UTF-8 `.txt` file (maximum 300 KB). Duplicate emails are removed. Default limit: **100** unique accounts.
+4. Optionally use `/emails` to review the extracted list. Then send `/run` **once after all forwards arrive**, read the risk notice, and tap **Approve full access + leak auto-disable OFF**.
 5. Download the CSV sent by the bot. Successful rows contain the new key; other rows explain their outcome. Checkpoints are sent after every ten processed accounts and a final/partial file at completion or pause.
 
 | Command | Action |
 | --- | --- |
 | `/batch` | Start password/email intake |
 | `/run` | Review and explicitly approve creation/settings |
-| `/status` | Current state and counts, without revealing the password |
+| `/status` | Current state, counts, and number of messages skipped without a readable address |
+| `/emails` | Review all extracted email addresses before approval |
 | `/results` | Download the current CSV again while it remains in RAM |
 | `/resume` | After a pause, process the **next queued email**, never retry a failed/uncertain row |
 | `/cancel` | Stop safely after an in-flight request, preserve results, clear password |
@@ -24,6 +25,17 @@ Owner-only Telegram bot for accounts you own or are authorized to manage. It sig
 | `/help` | Instructions and privacy notice |
 
 `/login` is a compatibility alias for `/batch`; it no longer opens a browser.
+
+### Forwarded posts and extraction
+
+- **No channel admin access is needed for private forwards.** Only forwards/messages sent by the configured owner into the private bot chat are accepted. Telegram bots cannot fetch old channel history merely by being made an admin; forward existing posts yourself. This version does not subscribe to or process channel posts directly.
+- Text such as “Your old email address has been successfully deleted / New temporary email address generated: / mailbox@example.com” is accepted. Surrounding prose is ignored.
+- Forwarded posts with no readable address are quietly skipped and counted in `/status`; ordinary pasted text without an address gets a helpful notice, not the old strict-format rejection.
+- Hidden `text_link` targets, captions, and inline-button URLs are inspected when Telegram supplies them. Encoded URL targets are decoded locally. External pages are **not** opened; a link that contains no address cannot reveal the address on its destination page. **Image-only text/OCR is not supported**—paste the address or supply it in a caption.
+- All detected addresses are included, even ones in footers/signatures. Review `/emails` before approving and only submit accounts you own/control. No key creation begins merely because a message was forwarded.
+- Forwarded text is data: a forwarded `/cancel`, `/run`, or other command cannot control the bot. A forwarded post also cannot become the shared password accidentally.
+- Input-copy deletion affects the private bot chat, **not original channel posts**. Bulk-forward acknowledgements are throttled to avoid a reply for every post. All accepted messages are still processed sequentially; `/emails` and `/run` show the complete collection.
+- Adding a new unique email invalidates an older approval button; repeated/duplicate or address-free forwards do not invalidate it.
 
 ## Exact behavior and limits
 

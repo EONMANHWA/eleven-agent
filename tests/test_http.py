@@ -141,8 +141,7 @@ def test_merge_deduplicate_and_limits():
     assert parse_emails('A@example.com,a@example.com; b@example.com') == ['A@example.com', 'b@example.com']
     with pytest.raises(ValueError):
         parse_emails('a@example.com\nb@example.com', 1)
-    with pytest.raises(ValueError):
-        parse_emails('bad heading\na@example.com')
+    assert parse_emails('Heading\na@example.com') == ['a@example.com']
 
 
 def test_csv_formula_safety_and_no_password_fields():

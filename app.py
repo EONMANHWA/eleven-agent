@@ -15,12 +15,13 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
 
-from eleven_http import ElevenClient, Row, PAUSE_STATUSES, csv_bytes, parse_emails
+from eleven_http import ElevenClient, Row, PAUSE_STATUSES, csv_bytes, parse_emails, extract_emails, message_email_text
 
 log = logging.getLogger('bot')
 HELP = ('Telegram-only ElevenLabs bot — no browser or panel.\n\n'
         '/batch — start: shared password, then emails\n'
         '/run — review and approve collected emails\n'
+        '/emails — review detected addresses\n'
         '/status — progress\n/results — download current CSV\n'
         '/resume — continue with the next queued account after a pause\n'
         '/cancel — stop safely and clear the password\n'
@@ -67,6 +68,7 @@ class Session:
     batch_id: str = ''
     position: int = 0
     delivered_keys: int = 0
+    skipped_messages: int = 0
     touched: float = field(default_factory=time.monotonic)
     stop: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -81,6 +83,7 @@ class Bot:
         self.worker = None
         self.input_tasks = set()
         self.progress_id = None
+        self.intake_notice_at = float('-inf')
         self.ready = False
         self.shutting_down = False
 
@@ -148,7 +151,7 @@ class Bot:
 
     async def email_document(self, document):
         if not str(document.get('file_name', '')).lower().endswith('.txt'):
-            raise ValueError('Upload a UTF-8 .txt file containing only emails, one per line.')
+            raise ValueError('Upload a UTF-8 .txt file containing text with email addresses, or forward the messages directly.')
         if not isinstance(document.get('file_size'), int) or not 0 < document['file_size'] <= 300000:
             raise ValueError('The .txt file must be no larger than 300 KB.')
         info = await self.telegram('getFile', {'file_id': document.get('file_id')})
@@ -167,7 +170,7 @@ class Bot:
                         raise ValueError('File exceeds 300 KB.')
                 return data.decode('utf-8-sig')
         except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError):
-            raise ValueError('Could not read the UTF-8 file. Paste plain emails instead.') from None
+            raise ValueError('Could not read the UTF-8 file. Paste or forward messages containing emails instead.') from None
 
     async def handle(self, update):
         async with self.lock:
@@ -205,7 +208,8 @@ class Bot:
                 return
             text = message.get('text', '')
             stripped = text.strip()
-            command = stripped.split(maxsplit=1)[0].split('@')[0].lower() if stripped else ''
+            forwarded = any(message.get(name) for name in ('forward_origin', 'forward_date', 'forward_from', 'forward_from_chat'))
+            command = stripped.split(maxsplit=1)[0].split('@')[0].lower() if stripped and not forwarded else ''
             if command in ('/start', '/help'):
                 await self.say(HELP)
                 return
@@ -213,8 +217,23 @@ class Bot:
                 keys = sum(bool(r.api_key) for r in s.rows)
                 await self.say(f'State: {s.mode}. Emails collected: {len(s.emails)}/{self.settings.maximum}. '
                                f'Accounts finished: {s.position}/{len(s.rows)}. Keys saved: {keys}.\n'
+                               f'Messages without readable email addresses skipped: {s.skipped_messages}.\n'
                                'Password and results are RAM-only. /results downloads saved keys. '
                                'After a pause, /resume processes ONLY the next queued account, not failed/uncertain rows.')
+                return
+            if command == '/emails':
+                if not s.emails:
+                    await self.say('No email addresses collected yet. Use /batch, send the shared password, then forward your messages.')
+                else:
+                    chunk = f'Detected addresses ({len(s.emails)}):\n'
+                    for index, email in enumerate(s.emails, 1):
+                        line = f'{index}. {email}\n'
+                        if len(chunk) + len(line) > 3500:
+                            await self.say(chunk)
+                            chunk = ''
+                        chunk += line
+                    if chunk:
+                        await self.say(chunk)
                 return
             if command == '/results':
                 await self.export()
@@ -276,12 +295,16 @@ class Bot:
                                'Approve ONE NEW unrestricted/full-access key per account, with leak auto-disable OFF. '
                                'Leaked keys can remain usable until you revoke them; full access increases the damage a leak can cause. '
                                'Plan limits and enforced workspace policies still apply. Existing keys will not be modified. '
-                               'Keys will be delivered here in a CSV.\n\n'
+                               'Keys will be delivered here in a CSV. Use /emails to review every detected address before approving. '
+                               'All detected addresses are included, even addresses in signatures or footers.\n\n'
                                'By approving, you confirm you own/control these accounts and accept these settings and Telegram delivery. '
                                '/cancel stops without starting.', reply_markup={'inline_keyboard': [[
                                    {'text': 'Approve full access + leak auto-disable OFF', 'callback_data': 'approve:' + s.nonce}]]})
                 return
             if s.mode == 'password':
+                if forwarded:
+                    await self.say('Send the shared password as a new plain-text message first, then forward the channel posts. This forward was not used as a password or added to the batch.')
+                    return
                 await self.delete_input(message)
                 password = text[len('/password '):] if text.startswith('/password ') else text
                 if not password or len(password) > 1024 or '\x00' in password:
@@ -289,24 +312,44 @@ class Bot:
                     return
                 s.password = password
                 s.mode = 'emails'
-                await self.say(f'Password received. Send up to {self.settings.maximum} emails, one per line, '
-                               'in one or several messages, or upload a UTF-8 .txt file. '
-                               'Duplicates are removed. Send /run when finished. I will try to delete email input messages too.')
+                await self.say(f'Password received. Forward the channel messages here, paste any text containing emails, '
+                               f'or upload a UTF-8 .txt file. I will extract up to {self.settings.maximum} unique emails '
+                               'from message text, captions, and email links, ignoring surrounding words and duplicates. '
+                               'Use /emails to review the list, then /run once when all forwards are sent. '
+                               'No channel admin access is needed. I will try to delete input copies from this private chat, not the channel originals.')
                 return
             if s.mode in ('emails', 'confirm'):
                 try:
-                    if message.get('document'):
+                    text = message_email_text(message)
+                    if message.get('document') and str(message['document'].get('file_name', '')).lower().endswith('.txt'):
                         try:
-                            text = await self.email_document(message['document'])
+                            text += '\n' + await self.email_document(message['document'])
                         finally:
                             await self.delete_input(message)
                     else:
                         await self.delete_input(message)
-                    added = parse_emails(text, self.settings.maximum)
+                    added = extract_emails(text, self.settings.maximum)
+                    if not added:
+                        s.skipped_messages += 1
+                        if not forwarded:
+                            await self.say('No email address found in this message. Send or forward another message containing the address. '
+                                           'If the address is only inside an image, paste its text or add a caption; image-only text is not read.')
+                        return
                     merged = parse_emails('\n'.join(s.emails + added), self.settings.maximum)
+                    existing = {old.casefold() for old in s.emails}
+                    new = [email for email in merged if email.casefold() not in existing]
                     s.emails = merged
-                    s.mode, s.nonce = 'emails', ''
-                    await self.say(f'{len(s.emails)} unique emails collected. Send more, or /run to review and approve.')
+                    if new:
+                        s.mode, s.nonce = 'emails', ''
+                    preview = '\n'.join(new[:5])
+                    if len(new) > 5:
+                        preview += f'\n… and {len(new) - 5} more (/emails to review).'
+                    # Bulk forwarding can generate many updates in a burst. Keep
+                    # intake sequential but avoid one outgoing reply per forward.
+                    if not forwarded or time.monotonic() - self.intake_notice_at >= 3:
+                        self.intake_notice_at = time.monotonic()
+                        await self.say(f'{len(new)} new emails found; {len(s.emails)} unique emails collected.\n'
+                                       f'{preview}\nForward more messages, or /run once when finished.')
                 except ValueError as exc:
                     await self.say(str(exc))
                 return
@@ -397,7 +440,7 @@ class Bot:
     async def register(self):
         commands = [{'command': name, 'description': desc} for name, desc in [
             ('batch', 'Start a Telegram-only batch'), ('run', 'Review emails and approve'),
-            ('status', 'Check progress'), ('results', 'Download current keys CSV'),
+            ('status', 'Check progress'), ('emails', 'Review extracted email addresses'), ('results', 'Download current keys CSV'),
             ('resume', 'Continue with next queued account'), ('cancel', 'Stop safely'),
             ('forget', 'Discard idle RAM data'), ('help', 'Instructions and privacy')]]
         while not self.shutting_down:

@@ -4,8 +4,10 @@ Never retry key creation, log provider bodies, or retain Firebase refresh tokens
 import asyncio
 import csv
 import io
+import html
 import re
 from dataclasses import dataclass
+from urllib.parse import unquote, urlsplit, parse_qsl
 
 import aiohttp
 
@@ -34,23 +36,83 @@ class ProviderError(Exception):
         super().__init__(kind)
 
 
-def parse_emails(text, maximum=100):
+# Extract candidates from prose, rather than requiring a clean address list.
+# Boundaries avoid treating the tail of a malformed address as a new address.
+LOCAL_CHARS = r"A-Za-z0-9!#$%&'*+/=?^_`{|}~\-"
+DOMAIN_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+EMAIL_FIND = re.compile(
+    rf"(?<![{LOCAL_CHARS}.@])"
+    rf"[{LOCAL_CHARS}]+(?:\.[{LOCAL_CHARS}]+)*@"
+    rf"(?:{DOMAIN_LABEL}\.)+[A-Za-z]{{2,63}}"
+    rf"(?![A-Za-z0-9_@-]|\.[A-Za-z0-9])"
+)
+
+
+def message_email_text(message):
+    """Visible text/caption plus explicit link targets. Never fetch external URLs.
+
+    Telegram text_link targets can hide a mailto address behind a label. Ordinary
+    email entities already occur in text, so UTF-16 offset slicing is unnecessary.
+    Inline button URLs are included when Telegram supplies them with a message.
+    """
+    pieces = [message.get('text', ''), message.get('caption', '')]
+    for name in ('entities', 'caption_entities'):
+        for entity in message.get(name) or []:
+            if isinstance(entity, dict) and isinstance(entity.get('url'), str):
+                pieces.append(entity['url'])
+    markup = message.get('reply_markup') or {}
+    if isinstance(markup, dict):
+        for row in markup.get('inline_keyboard') or []:
+            for button in row:
+                if isinstance(button, dict) and isinstance(button.get('url'), str):
+                    pieces.append(button['url'])
+    return '\n'.join(value for value in pieces if isinstance(value, str))
+
+
+def link_email_text(match):
+    """Extract URL components without mistaking a URL prefix for a mailbox."""
+    try:
+        parsed = urlsplit(match.group())
+        if parsed.scheme.lower() == 'mailto':
+            parts = [unquote(parsed.path)]
+        else:
+            # Decode after path splitting so encoded characters in the actual
+            # mailbox remain intact. Never treat HTTP userinfo as an email.
+            parts = [unquote(segment) for segment in parsed.path.split('/')]
+        parts.extend(value for _, value in parse_qsl(parsed.query))
+        parts.extend(unquote(segment) for segment in re.split(r'[/&=]', parsed.fragment))
+        return '\n' + '\n'.join(parts) + '\n'
+    except ValueError:
+        return '\n'
+
+
+def extract_emails(text, maximum=100):
     if len(text) > 300000:
-        raise ValueError('Email list is too large.')
-    values = re.split(r'[\s,;]+', text.strip())
+        raise ValueError('Message or file is too large (maximum 300 KB of text).')
+    text = html.unescape(text)
+    text = re.sub(r'(?:https?://|mailto:)[^\s<>]+', link_email_text, text, flags=re.IGNORECASE)
+    # Pasted formatting wrappers are not part of the mailbox name. Internal
+    # apostrophes and plus-addressing remain intact.
+    for marker in ('**', '__', '~~', '`', '"', "'", '*'):
+        escaped = re.escape(marker)
+        text = re.sub(escaped + r'([^\s<>]{1,64}@[^\s<>]{1,253}?)' + escaped, r'\1', text)
     result, seen = [], set()
-    for email in values:
-        if not email:
+    for match in EMAIL_FIND.finditer(text):
+        email = match.group()
+        if len(email) > 254 or len(email.split('@')[0]) > 64:
             continue
-        if len(email) > 254 or not EMAIL_RE.fullmatch(email):
-            raise ValueError('Use plain email addresses separated by lines, spaces, commas, or semicolons. No headings.')
         if email.casefold() not in seen:
             seen.add(email.casefold())
             result.append(email)
-    if not result:
-        raise ValueError('No email addresses found.')
     if len(result) > maximum:
-        raise ValueError(f'Maximum {maximum} unique emails per batch.')
+        raise ValueError(f'Maximum {maximum} unique emails per batch. Nothing from this message was added.')
+    return result
+
+
+def parse_emails(text, maximum=100):
+    result = extract_emails(text, maximum)
+    if not result:
+        raise ValueError('No email address found in that message. Send or forward another message containing an address. Images need a text caption; image-only addresses cannot be read.')
     return result
 
 
