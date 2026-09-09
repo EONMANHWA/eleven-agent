@@ -56,7 +56,8 @@ async def test_complete_telegram_flow_and_no_password_echo():
     await bot.worker
     assert bot.client.account.await_count == 1
     assert bot.session.password == '' and bot.session.mode == 'done'
-    assert any(method == 'sendDocument' for method, _, _ in bot.sent)
+    assert not any(method == 'sendDocument' for method, _, _ in bot.sent)
+    assert any(method == 'sendMessage' and 'API key:' in data['text'] for method, data, _ in bot.sent)
     assert 'synthetic-secret-password' not in json.dumps([d for _, d, _ in bot.sent])
     assert {d['message_id'] for method, d, _ in bot.sent if method == 'deleteMessage'} >= {2, 3}
 
@@ -112,7 +113,7 @@ async def test_cancel_before_approval_clears_password():
 
 
 @pytest.mark.asyncio
-async def test_pause_does_not_retry_unknown_row():
+async def test_unknown_row_is_skipped_without_pause_or_retry():
     bot = FakeBot()
     bot.session = Session(mode='running', password='test', emails=['a@example.com', 'b@example.com'],
                           rows=[Row('a@example.com', 'one'), Row('b@example.com', 'two')])
@@ -121,9 +122,7 @@ async def test_pause_does_not_retry_unknown_row():
     bot.client.account = AsyncMock(side_effect=account)
     bot.worker = asyncio.create_task(bot.run())
     await bot.worker
-    assert bot.session.mode == 'paused' and bot.session.position == 1
-    await bot.handle(message(1, '/resume'))
-    await bot.worker
+    assert bot.session.mode == 'done' and bot.session.position == 2
     assert bot.client.account.await_count == 2
     assert [call.args[0].name for call in bot.client.account.await_args_list] == ['one', 'two']
     assert bot.session.password == ''
@@ -233,11 +232,12 @@ async def test_100_account_worker_is_sequential_and_creates_once_each(monkeypatc
     assert bot.client.account.await_count == 100
     assert len({call.args[0].name for call in bot.client.account.await_args_list}) == 100
     assert bot.session.position == 100 and bot.session.password == ''
-    assert sum(method == 'sendDocument' for method, _, _ in bot.sent) == 10
+    assert sum(method == 'sendDocument' for method, _, _ in bot.sent) == 0
+    assert sum(method == 'sendMessage' and 'API key:' in data['text'] for method, data, _ in bot.sent) == 100
 
 
 @pytest.mark.asyncio
-async def test_three_rejected_logins_pause_shared_password_batch(monkeypatch):
+async def test_rejected_logins_do_not_pause_batch(monkeypatch):
     async def no_delay(coro, timeout):
         coro.close()
         raise asyncio.TimeoutError()
@@ -249,14 +249,14 @@ async def test_three_rejected_logins_pause_shared_password_batch(monkeypatch):
     bot.client.account = AsyncMock(side_effect=rejected)
     bot.worker = asyncio.create_task(bot.run())
     await bot.worker
-    assert bot.session.mode == 'paused' and bot.session.position == 3
+    assert bot.session.mode == 'done' and bot.session.position == 5
     await bot.handle(message(1, '/cancel'))
     assert bot.session.password == ''
-    assert [r.status for r in bot.session.rows[3:]] == ['cancelled', 'cancelled']
+    assert [r.status for r in bot.session.rows] == ['login_rejected'] * 5
 
 
 @pytest.mark.asyncio
-async def test_failed_checkpoint_delivery_stops_further_creations(monkeypatch):
+async def test_failed_text_delivery_keeps_keys_and_does_not_pause(monkeypatch):
     async def no_delay(coro, timeout):
         coro.close()
         raise asyncio.TimeoutError()
@@ -265,11 +265,15 @@ async def test_failed_checkpoint_delivery_stops_further_creations(monkeypatch):
     bot.session = Session(mode='running', password='test', rows=[Row(f'a{i}@example.com', str(i)) for i in range(12)])
     original = bot.telegram
     async def telegram(method, data=None, form=None):
-        if method == 'sendDocument':
+        if method == 'sendMessage' and 'API key:' in data.get('text', ''):
             return None
         return await original(method, data, form)
     bot.telegram = telegram
     bot.worker = asyncio.create_task(bot.run())
     await bot.worker
-    assert bot.session.mode == 'paused' and bot.client.account.await_count == 10
-    assert sum(bool(r.api_key) for r in bot.session.rows) == 10
+    assert bot.session.mode == 'done' and bot.client.account.await_count == 12
+    assert sum(bool(r.api_key) for r in bot.session.rows) == 12
+    assert not any(r.text_delivered for r in bot.session.rows)
+    bot.telegram = original
+    await bot.export()
+    assert all(r.text_delivered for r in bot.session.rows)

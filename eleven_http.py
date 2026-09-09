@@ -6,6 +6,9 @@ import csv
 import io
 import html
 import re
+import time
+import math
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit, parse_qsl
 
@@ -15,8 +18,6 @@ API = 'https://api.elevenlabs.io'
 FIREBASE = 'https://identitytoolkit.googleapis.com/v1/accounts:'
 EMAIL_RE = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,63}\Z")
 KEY_RE = re.compile(r'[A-Za-z0-9_-]{20,256}\Z')
-PAUSE_STATUSES = {'verification_required', 'rate_limited', 'service_unavailable',
-                  'creation_unknown', 'created_settings_unverified', 'protocol_changed'}
 
 
 @dataclass(repr=False)
@@ -28,12 +29,63 @@ class Row:
     full_access: str = 'not verified'
     leak_auto_disable: str = 'not verified'
     note: str = ''
+    attempts: int = 0
+    failure_stage: str = ''
+    creation_attempted: bool = False
+    retryable: bool = False
+    throttled: bool = False
+    retry_after: float = 0
+    text_delivered: bool = False
 
 
 class ProviderError(Exception):
-    def __init__(self, status, kind):
+    def __init__(self, status, kind, retry_after=0):
         self.status, self.kind = status, kind
+        self.retry_after = retry_after
         super().__init__(kind)
+
+
+def retry_after_seconds(value):
+    """Respect provider Retry-After seconds or HTTP dates; never log the header."""
+    if not value:
+        return 0
+    try:
+        delay = float(value)
+    except (ValueError, TypeError):
+        try:
+            delay = parsedate_to_datetime(value).timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            return 0
+    return max(0, delay) if math.isfinite(delay) else 0
+
+
+def key_text(row):
+    return (f'Email: {row.email}\nAPI key:\n{row.api_key}\n'
+            f'Full access: {row.full_access}; leak auto-disable: {row.leak_auto_disable}\n'
+            f'Status: {row.status}\n')
+
+
+def result_chunks(rows, only_undelivered=False):
+    """Plain-text result chunks plus the rows whose keys each chunk contains."""
+    chunks, text, keys = [], '', []
+    for row in rows:
+        if only_undelivered and (not row.api_key or row.text_delivered):
+            continue
+        if row.api_key:
+            block = key_text(row)
+        else:
+            block = (f'Email: {row.email}\nStatus: {row.status}\n'
+                     f'Attempts: {row.attempts}; stage: {row.failure_stage or "—"}\n{row.note}\n')
+            if row.creation_attempted:
+                block += f'Key name to check: {row.name}\n'
+        if text and len(text) + len(block) + 1 > 3500:
+            chunks.append((text, keys)); text, keys = '', []
+        text += block + '\n'
+        if row.api_key:
+            keys.append(row)
+    if text:
+        chunks.append((text, keys))
+    return chunks
 
 
 # Extract candidates from prose, rather than requiring a clean address list.
@@ -119,13 +171,13 @@ def parse_emails(text, maximum=100):
 def csv_bytes(rows):
     stream = io.StringIO(newline='')
     writer = csv.writer(stream)
-    writer.writerow(['email', 'api_key', 'key_name', 'status', 'full_access', 'leak_auto_disable', 'note'])
+    writer.writerow(['email', 'api_key', 'key_name', 'status', 'full_access', 'leak_auto_disable', 'note', 'attempts', 'failure_stage'])
     def safe(value):
         value = str(value)
         return "'" + value if value[:1] in ('=', '+', '-', '@', '\t', '\r', '\n') else value
     for row in rows:
         writer.writerow([safe(v) for v in (row.email, row.api_key, row.name, row.status,
-                                         row.full_access, row.leak_auto_disable, row.note)])
+                                         row.full_access, row.leak_auto_disable, row.note, row.attempts, row.failure_stage)])
     return stream.getvalue().encode('utf-8-sig')
 
 
@@ -172,11 +224,19 @@ class ElevenClient:
             if not isinstance(data, dict):
                 data = {}
             if response.status not in (200, 201):
-                raise ProviderError(response.status, error_kind(response.status, data))
+                raise ProviderError(response.status, error_kind(response.status, data),
+                                    retry_after_seconds(response.headers.get('Retry-After')))
             return data
 
     async def account(self, row, password, stop):
         token = ''
+        # Even a mistakenly repeated call must never submit a second creation.
+        if row.creation_attempted or row.api_key:
+            return
+        row.attempts += 1
+        row.retryable = row.throttled = False
+        row.retry_after = 0
+        row.failure_stage = ''
         try:
             if stop.is_set():
                 row.status = 'cancelled'
@@ -213,6 +273,7 @@ class ElevenClient:
                 row.status = 'cancelled'
                 return
             row.status = 'creating'
+            row.creation_attempted = True
             # Exact personal-key UI semantics: omitted permissions = unrestricted.
             # This call is attempted ONCE. No fallback payloads or automatic retries.
             created = await self.request(API + '/v1/user/create-api-key',
@@ -241,6 +302,11 @@ class ElevenClient:
             else:
                 row.note = 'Key created, but requested settings could not all be confirmed. Check this key; do not rerun blindly.'
         except ProviderError as exc:
+            row.failure_stage = row.status
+            row.retry_after = exc.retry_after
+            row.throttled = exc.kind == 'rate_limited'
+            row.retryable = (not row.creation_attempted and not row.api_key
+                             and exc.kind in ('rate_limited', 'service_unavailable'))
             if row.api_key:
                 row.status = 'created_settings_unverified'
                 row.note = 'Key saved, but verification failed. Do not create another key automatically.'
@@ -249,15 +315,26 @@ class ElevenClient:
                 row.note = 'Creation outcome is uncertain. Check the named key in ElevenLabs before retrying.'
             else:
                 row.status = exc.kind
-                row.note = f'Provider rejected the request (HTTP {exc.status}). No automatic retry.'
+                reasons = {
+                    'login_rejected': 'Sign-in rejected. Check the email/password and whether the account exists or is disabled.',
+                    'rate_limited': 'Provider rate limit. Automatic waiting applies; success is not guaranteed.',
+                    'service_unavailable': 'Temporary provider service failure.',
+                    'verification_required': 'Provider requires verification (such as email verification, CAPTCHA, or 2FA). Resolve it directly with ElevenLabs.',
+                    'protocol_changed': 'Provider rejected the request format or endpoint; the HTTP interface may have changed.',
+                    'access_denied': 'Provider denied account/workspace access.'}
+                row.note = f'{reasons.get(exc.kind, "Request rejected.")} HTTP {exc.status}; stage: {row.failure_stage}.'
         except asyncio.CancelledError:
+            row.failure_stage = row.status
             if row.status == 'creating':
                 row.status = 'creation_unknown'
                 row.note = 'Process interrupted during creation. Check the named key before retrying.'
             elif not row.api_key:
                 row.status = 'interrupted'
             raise
-        except Exception:
+        except Exception as exc:
+            row.failure_stage = row.status
+            row.retryable = (not row.creation_attempted and not row.api_key
+                             and isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError, OSError)))
             if row.api_key:
                 row.status = 'created_settings_unverified'
                 row.note = 'Key saved, but verification did not finish. Do not rerun automatically.'
@@ -265,7 +342,7 @@ class ElevenClient:
                 row.status = 'creation_unknown'
                 row.note = 'Creation connection failed. It may have succeeded. Check the named key before retrying.'
             else:
-                row.status = 'service_unavailable'
-                row.note = 'Connection or protocol failure before key creation. No automatic retry.'
+                row.status = 'service_unavailable' if row.retryable else 'protocol_changed'
+                row.note = 'Connection or protocol failure before key creation; stage: ' + row.failure_stage + '.'
         finally:
             password = token = ''

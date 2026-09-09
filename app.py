@@ -15,23 +15,24 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
 
-from eleven_http import ElevenClient, Row, PAUSE_STATUSES, csv_bytes, parse_emails, extract_emails, message_email_text
+from eleven_http import ElevenClient, Row, key_text, result_chunks, retry_after_seconds, csv_bytes, parse_emails, extract_emails, message_email_text
 
 log = logging.getLogger('bot')
 HELP = ('Telegram-only ElevenLabs bot — no browser or panel.\n\n'
         '/batch — start: shared password, then emails\n'
         '/run — review and approve collected emails\n'
         '/emails — review detected addresses\n'
-        '/status — progress\n/results — download current CSV\n'
-        '/resume — continue with the next queued account after a pause\n'
+        '/status — progress / automatic-wait countdown\n/results — keys and outcomes as text\n'
+        '/csv — optional CSV backup\n'
         '/cancel — stop safely and clear the password\n'
         '/forget — discard idle input and saved results\n\n'
         'Each approved batch creates ONE NEW key per account; existing keys are not changed. '
         'Use only accounts you own or are authorized to manage. '
         'CAPTCHA, 2FA, and rate limits are not bypassed. '
         'Bot chats are not end-to-end encrypted. Input deletion is best effort, '
-        'not a guarantee that all copies disappear. Results are sent here as private CSV files. '
-        'Free-host restarts clear RAM; download your results.')
+        'not a guarantee that all copies disappear. Keys are sent here as plain text as they are collected. '
+        'Failures are recorded and skipped automatically; transient pre-creation failures get one retry after a wait. '
+        'No manual /resume is needed. Free-host restarts can interrupt long runs and clear RAM.')
 
 
 @dataclass(repr=False)
@@ -69,6 +70,7 @@ class Session:
     position: int = 0
     delivered_keys: int = 0
     skipped_messages: int = 0
+    wait_until: float = 0
     touched: float = field(default_factory=time.monotonic)
     stop: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -79,6 +81,8 @@ class Bot:
         self.client = ElevenClient(http, settings.firebase_key)
         self.session = Session()
         self.lock = asyncio.Lock()
+        self.send_lock = asyncio.Lock()
+        self.last_send_at = float('-inf')
         self.seen = set()
         self.worker = None
         self.input_tasks = set()
@@ -92,15 +96,28 @@ class Bot:
         return self.worker is not None and not self.worker.done()
 
     async def telegram(self, method, data=None, form=None):
-        try:
-            async with self.http.post('https://api.telegram.org/bot' + self.settings.bot_token + '/' + method,
-                                      json=data if form is None else None, data=form,
-                                      timeout=aiohttp.ClientTimeout(total=12), allow_redirects=False) as response:
-                result = await response.json()
-                if response.status == 200 and result.get('ok'):
-                    return result.get('result')
-        except Exception:
-            pass  # No URL, token, payload, exception detail, or message content in logs.
+        # Serialize outgoing chat messages and respect Telegram's own flood waits.
+        # Never retry an uncertain network result; an explicit 429 is safe to retry.
+        async with self.send_lock:
+            for attempt in range(2):
+                try:
+                    if method in ('sendMessage', 'sendDocument', 'editMessageText'):
+                        await asyncio.sleep(max(0, 1.05 - (time.monotonic() - self.last_send_at)))
+                    async with self.http.post('https://api.telegram.org/bot' + self.settings.bot_token + '/' + method,
+                                              json=data if form is None else None, data=form,
+                                              timeout=aiohttp.ClientTimeout(total=12), allow_redirects=False) as response:
+                        result = await response.json()
+                        if method in ('sendMessage', 'sendDocument', 'editMessageText'):
+                            self.last_send_at = time.monotonic()
+                        if response.status == 200 and result.get('ok'):
+                            return result.get('result')
+                        if response.status == 429 and attempt == 0 and form is None:
+                            delay = retry_after_seconds(str(result.get('parameters', {}).get('retry_after', 1)))
+                            await asyncio.sleep(max(1, delay))
+                            continue
+                except Exception:
+                    pass  # No tokens, URLs, payloads, or exception details in logs.
+                break
         return None
 
     async def say(self, text, **extra):
@@ -112,7 +129,36 @@ class Bot:
         if not deleted:
             await self.say('I could not delete your input message. Please delete it manually if it contains private information.')
 
-    async def export(self, caption='Current results. Keep this CSV private.'):
+    async def deliver_key(self, row):
+        if not row.api_key or row.text_delivered:
+            return True
+        if await self.say(key_text(row)):
+            row.text_delivered = True
+            self.session.delivered_keys = max(self.session.delivered_keys,
+                                              sum(r.text_delivered for r in self.session.rows))
+            return True
+        return False
+
+    async def export(self, caption='Current results as text. Keep keys private.', only_undelivered=False):
+        s = self.session
+        if not s.rows:
+            await self.say('No results yet. Use /batch to begin.')
+            return False
+        chunks = result_chunks(s.rows, only_undelivered)
+        if not chunks:
+            return True
+        if not await self.say(caption):
+            return False
+        for text, key_rows in chunks:
+            if not await self.say(text):
+                await self.say('Text delivery failed. Saved keys remain in RAM: use /results soon. Do not recreate keys to recover results.')
+                return False
+            for row in key_rows:
+                row.text_delivered = True
+            s.delivered_keys = max(s.delivered_keys, sum(r.text_delivered for r in s.rows))
+        return True
+
+    async def export_csv(self, caption='Optional CSV backup. Keep it private.'):
         s = self.session
         if not s.rows:
             await self.say('No results yet. Use /batch to begin.')
@@ -203,7 +249,8 @@ class Bot:
                 s.rows = [Row(email, f'tg-{s.batch_id}-{index + 1:04d}') for index, email in enumerate(s.emails)]
                 s.mode = 'running'
                 await self.say('Approved: full access, leak auto-disable OFF. Processing sequentially. '
-                               'Each creation is attempted once. /cancel stops safely; /results downloads current results.')
+                               'Key creation is attempted once per email. Failures do not pause the batch. Transient errors before creation get one automatic retry after a wait. '
+                               '/cancel stops safely; /results sends keys as text.')
                 self.worker = asyncio.create_task(self.run())
                 return
             text = message.get('text', '')
@@ -218,8 +265,9 @@ class Bot:
                 await self.say(f'State: {s.mode}. Emails collected: {len(s.emails)}/{self.settings.maximum}. '
                                f'Accounts finished: {s.position}/{len(s.rows)}. Keys saved: {keys}.\n'
                                f'Messages without readable email addresses skipped: {s.skipped_messages}.\n'
-                               'Password and results are RAM-only. /results downloads saved keys. '
-                               'After a pause, /resume processes ONLY the next queued account, not failed/uncertain rows.')
+                               f'Automatic wait remaining: {max(0, int(s.wait_until - time.monotonic()))} seconds.\n'
+                               'Password and results are RAM-only. /results sends keys as text. '
+                               'No manual /resume is needed; /cancel stops the batch.')
                 return
             if command == '/emails':
                 if not s.emails:
@@ -234,6 +282,9 @@ class Bot:
                         chunk += line
                     if chunk:
                         await self.say(chunk)
+                return
+            if command == '/csv':
+                await self.export_csv()
                 return
             if command == '/results':
                 await self.export()
@@ -263,8 +314,8 @@ class Bot:
                 await self.say('Input and results discarded from active RAM state. This does not revoke keys or delete Telegram copies.')
                 return
             if command in ('/batch', '/login'):
-                if self.active or s.mode == 'paused':
-                    await self.say('A batch is active or paused. Use /status, /resume, or /cancel first.')
+                if self.active:
+                    await self.say('A batch is running or waiting automatically. Use /status or /cancel first.')
                     return
                 count = sum(bool(row.api_key) for row in s.rows)
                 if count > s.delivered_keys and not await self.export('Previous batch results, before starting a new batch.'):
@@ -277,13 +328,8 @@ class Bot:
                                'Input expires after 15 minutes of inactivity.')
                 return
             if command in ('/resume', '/skip'):
-                if s.mode != 'paused' or self.active or not s.password:
-                    await self.say('No resumable batch. Use /status. After a restart or password expiry, start a new /batch for unprocessed emails only.')
-                    return
-                s.mode = 'running'
-                s.stop.clear()
-                await self.say('Continuing with the next queued email. Failed, blocked, and uncertain accounts will NOT be retried.')
-                self.worker = asyncio.create_task(self.run())
+                await self.say('This version continues automatically, including waits for rate limits. No /resume is needed. '
+                               'Use /status to check progress or /cancel to stop. Completed batches do not automatically restart.')
                 return
             if command == '/run':
                 if s.mode not in ('emails', 'confirm') or not s.password or not s.emails:
@@ -295,7 +341,7 @@ class Bot:
                                'Approve ONE NEW unrestricted/full-access key per account, with leak auto-disable OFF. '
                                'Leaked keys can remain usable until you revoke them; full access increases the damage a leak can cause. '
                                'Plan limits and enforced workspace policies still apply. Existing keys will not be modified. '
-                               'Keys will be delivered here in a CSV. Use /emails to review every detected address before approving. '
+                               'Keys will be delivered here as plain text. Account failures will be recorded and processing will continue automatically. Use /emails to review every detected address before approving. '
                                'All detected addresses are included, even addresses in signatures or footers.\n\n'
                                'By approving, you confirm you own/control these accounts and accept these settings and Telegram delivery. '
                                '/cancel stops without starting.', reply_markup={'inline_keyboard': [[
@@ -358,63 +404,92 @@ class Bot:
                 await self.delete_input(message)
             await self.say('Use /batch to begin, /status for progress, or /help for instructions. No credentials were added.')
 
+    async def automatic_wait(self, seconds, reason):
+        s = self.session
+        s.wait_until = time.monotonic() + seconds
+        s.mode = 'waiting' if seconds >= 5 else 'running'
+        if seconds >= 5:
+            await self.progress(f'Automatic wait: {int(seconds)} seconds. {reason}\n'
+                                f'{s.position}/{len(s.rows)} accounts finished. No /resume needed; /cancel stops safely.')
+        try:
+            remaining = max(0, s.wait_until - time.monotonic())
+            if remaining:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(s.stop.wait(), timeout=remaining)
+            return not s.stop.is_set()
+        finally:
+            s.wait_until = 0
+            s.mode = 'running'
+
     async def run(self):
         s = self.session
-        start = time.monotonic()
-        failures = 0
-        pause_note = ''
+        rate_streak = 0
+        next_delay = 0
+        final_note = ''
         try:
             while s.position < len(s.rows) and not s.stop.is_set():
+                if next_delay and not await self.automatic_wait(next_delay, 'Respecting the provider cooldown before the next account.'):
+                    break
+                next_delay = 0
                 row = s.rows[s.position]
-                await self.client.account(row, s.password, s.stop)
+                for attempt in range(2):
+                    await self.client.account(row, s.password, s.stop)
+                    if row.throttled or row.status == 'rate_limited':
+                        rate_streak += 1
+                        next_delay = max(row.retry_after, min(600, 60 * 2 ** min(rate_streak - 1, 4)))
+                    elif row.status == 'service_unavailable':
+                        next_delay = max(row.retry_after, 15)
+                    else:
+                        rate_streak = 0
+                        next_delay = row.retry_after
+                    if not (attempt == 0 and row.retryable and not row.creation_attempted
+                            and not row.api_key and not s.stop.is_set()):
+                        break
+                    if not await self.automatic_wait(max(15, next_delay),
+                            'Retrying this transient failure once. Key creation has not started.'):
+                        break
+                    next_delay = 0
                 s.position += 1
-                failures = failures + 1 if row.status == 'login_rejected' else 0
+                if row.retryable and row.attempts >= 2:
+                    row.note += ' Automatic retry exhausted; moving to the next email.'
+                if row.api_key:
+                    await self.deliver_key(row)
                 if row.status != 'created_verified' or s.position == 1 or s.position % 5 == 0:
                     await self.progress(f'{s.position}/{len(s.rows)} accounts finished. '
                                         f'{sum(bool(r.api_key) for r in s.rows)} keys saved.\n'
-                                        f'Last account: {row.email}\nStatus: {row.status}\n{row.note}\n/results for the current CSV.')
-                if row.status in PAUSE_STATUSES or failures >= 3:
-                    s.mode = 'paused'
-                    pause_note = ('Verification, rate limit, uncertain outcome, or protocol error needs attention. '
-                                  'No browser will open and no failed account will be automatically retried.')
-                    break
-                if time.monotonic() - start >= 480 and s.position < len(s.rows):
-                    s.mode = 'paused'
-                    pause_note = 'Paused at the eight-minute work window to keep free-host runs bounded.'
-                    break
+                                        f'Last account: {row.email}\nStatus: {row.status}\n{row.note}\n'
+                                        'Continuing automatically. /results sends keys and outcomes as text.')
+                # Retry text delivery periodically, without recreating keys or
+                # interrupting the remaining account queue if Telegram is down.
                 if s.position % 10 == 0 and s.position < len(s.rows):
-                    if not await self.export('Checkpoint: partial results. More accounts may still be running.'):
-                        s.mode = 'paused'
-                        pause_note = 'Paused because CSV delivery failed. Use /results before continuing.'
+                    await self.export('Previously undelivered keys (text checkpoint).', only_undelivered=True)
+                if s.position < len(s.rows) and not next_delay:
+                    if not await self.automatic_wait(2, 'Normal sequential pacing.'):
                         break
-                if s.position < len(s.rows):
-                    with contextlib.suppress(asyncio.TimeoutError):
-                        await asyncio.wait_for(s.stop.wait(), timeout=1)
         except asyncio.CancelledError:
             s.stop.set()
-            pause_note = 'Host shutdown interrupted the batch. Review uncertain rows before starting any new batch.'
+            final_note = 'Host shutdown interrupted the batch. Review uncertain rows before starting any new batch.'
         except Exception:
             s.stop.set()
-            pause_note = 'Batch stopped after an internal error; no automatic retry. Check saved results.'
+            final_note = 'An internal error stopped the worker. Saved results follow; uncertain creations must be checked manually.'
             log.warning('Batch stopped; sensitive error details suppressed.')
         finally:
+            s.mode = 'done'
+            s.wait_until = 0
+            s.password = ''
+            s.touched = time.monotonic()
             if s.stop.is_set():
-                s.mode = 'done'
                 for row in s.rows:
                     if row.status == 'queued':
                         row.status = 'cancelled'
-            elif s.position >= len(s.rows):
-                s.mode = 'done'
-            if s.mode != 'paused':
-                s.password = ''
-            s.touched = time.monotonic()
-            await self.export('Partial results: batch paused.' if s.mode == 'paused' else 'Batch results. Shared password cleared from active state.')
-            await self.say((f'Paused after {s.position}/{len(s.rows)} accounts. {pause_note}\n'
-                            'Use /resume ONLY to move to the next queued email, /results to save keys, or /cancel. '
-                            'The password expires after 15 minutes of inactivity.') if s.mode == 'paused' else
-                           (f'Finished/stopped: {s.position}/{len(s.rows)} accounts processed, '
-                            f'{sum(bool(r.api_key) for r in s.rows)} keys saved. {pause_note}\n'
-                            'Download the CSV. /batch creates a new batch; never blindly rerun uncertain accounts.'))
+            await self.export('Saved keys not yet delivered, as text.', only_undelivered=True)
+            failures = [row for row in s.rows if not row.api_key and row.status != 'queued']
+            await self.say(f'Finished/stopped: {s.position}/{len(s.rows)} accounts processed; '
+                           f'{sum(bool(r.api_key) for r in s.rows)} keys saved. {final_note}\n'
+                           'Shared password cleared. Keys are plain-text messages above. /results resends all saved results; /csv is optional. '
+                           'Retry only accounts without a key after resolving their errors. Never blindly rerun an uncertain creation.')
+            for text, _ in result_chunks(failures):
+                await self.say(text)
 
     async def housekeeping(self):
         while True:
@@ -440,8 +515,8 @@ class Bot:
     async def register(self):
         commands = [{'command': name, 'description': desc} for name, desc in [
             ('batch', 'Start a Telegram-only batch'), ('run', 'Review emails and approve'),
-            ('status', 'Check progress'), ('emails', 'Review extracted email addresses'), ('results', 'Download current keys CSV'),
-            ('resume', 'Continue with next queued account'), ('cancel', 'Stop safely'),
+            ('status', 'Check progress'), ('emails', 'Review extracted email addresses'), ('results', 'Send saved keys as plain text'), ('csv', 'Optional CSV backup'),
+            ('cancel', 'Stop safely'),
             ('forget', 'Discard idle RAM data'), ('help', 'Instructions and privacy')]]
         while not self.shutting_down:
             result = await self.telegram('setWebhook', {'url': self.settings.public_url.rstrip('/') + '/telegram',
@@ -450,7 +525,7 @@ class Bot:
             if result:
                 self.ready = True
                 await self.telegram('setMyCommands', {'commands': commands})
-                await self.telegram('setMyDescription', {'description': 'Private, owner-only ElevenLabs key manager. Telegram-only input and CSV results; no browser. Use /batch.'})
+                await self.telegram('setMyDescription', {'description': 'Private, owner-only ElevenLabs key manager. Automatic batch continuation and plain-text keys; no browser. Use /batch.'})
                 return
             log.warning('Webhook registration not ready; retrying without logging credentials.')
             await asyncio.sleep(20)
@@ -464,7 +539,8 @@ def create_app(bot):
     app[BOT_KEY] = bot
 
     async def health(request):
-        return web.json_response({'ok': True, 'mode': 'telegram-http', 'browser': False, 'webhook_ready': bot.ready})
+        return web.json_response({'ok': True, 'mode': 'telegram-http', 'browser': False, 'webhook_ready': bot.ready,
+                                  'automatic_continuation': True, 'key_delivery': 'plain_text'})
 
     async def root(request):
         return web.Response(text='Telegram-only bot. No browser or control panel. Open your Telegram bot and send /batch.\n')
