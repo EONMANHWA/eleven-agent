@@ -9,11 +9,12 @@ import logging
 import os
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, asdict
 from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import web
+from checkpoint import CheckpointStore, StorageError, LeaseLost, JobExpired
 
 from eleven_http import ElevenClient, Row, key_text, result_chunks, retry_after_seconds, csv_bytes, parse_emails, extract_emails, message_email_text
 
@@ -32,7 +33,7 @@ HELP = ('Telegram-only ElevenLabs bot — no browser or panel.\n\n'
         'Bot chats are not end-to-end encrypted. Input deletion is best effort, '
         'not a guarantee that all copies disappear. Keys are sent here as plain text as they are collected. '
         'Failures are recorded and skipped automatically; transient pre-creation failures get one retry after a wait. '
-        'No manual /resume is needed. Free-host restarts can interrupt long runs and clear RAM.')
+        'No manual /resume is needed. When encrypted recovery is configured, unfinished approved jobs survive host restarts and are resumed by the due-job scheduler. ')
 
 
 @dataclass(repr=False)
@@ -43,17 +44,28 @@ class Settings:
     firebase_key: str
     public_url: str = ''
     maximum: int = 100
+    supabase_url: str = ''
+    supabase_key: str = ''
+    checkpoint_key: str = ''
+    wakeup_secret: str = ''
 
     @classmethod
     def env(cls):
         return cls(os.getenv('TELEGRAM_BOT_TOKEN', ''), os.getenv('TELEGRAM_WEBHOOK_SECRET', ''),
                    int(os.getenv('ADMIN_CHAT_ID', '0')), os.getenv('ELEVENLABS_FIREBASE_API_KEY', ''),
                    os.getenv('PUBLIC_BASE_URL') or os.getenv('RENDER_EXTERNAL_URL', ''),
-                   max(1, min(1000, int(os.getenv('MAX_BATCH_ACCOUNTS', '100')))))
+                   max(1, min(1000, int(os.getenv('MAX_BATCH_ACCOUNTS', '100')))),
+                   os.getenv('SUPABASE_URL',''), os.getenv('SUPABASE_SERVICE_ROLE_KEY',''),
+                   os.getenv('CHECKPOINT_ENCRYPTION_KEY',''), os.getenv('JOB_WAKEUP_SECRET',''))
 
     def validate(self):
         if not self.bot_token or len(self.webhook_secret) < 32 or self.owner <= 0 or not self.firebase_key:
             raise RuntimeError('Required Telegram owner/secrets or Firebase public client configuration are missing.')
+        storage = [self.supabase_url, self.supabase_key, self.checkpoint_key, self.wakeup_secret]
+        if any(storage) and (not all(storage) or len(self.wakeup_secret) < 32):
+            raise RuntimeError('Durable recovery configuration must be complete.')
+        if self.supabase_url and (urlparse(self.supabase_url).scheme != 'https' or not urlparse(self.supabase_url).hostname):
+            raise RuntimeError('Supabase URL must use HTTPS.')
         parsed = urlparse(self.public_url)
         if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.query or parsed.fragment:
             raise RuntimeError('PUBLIC_BASE_URL / RENDER_EXTERNAL_URL must be an HTTPS service URL.')
@@ -71,6 +83,11 @@ class Session:
     delivered_keys: int = 0
     skipped_messages: int = 0
     wait_until: float = 0
+    wake_at: float = 0
+    expires_at: float = 0
+    rate_streak: int = 0
+    next_delay: float = 0
+    stop_reason: str = ''
     touched: float = field(default_factory=time.monotonic)
     stop: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -90,6 +107,132 @@ class Bot:
         self.intake_notice_at = float('-inf')
         self.ready = False
         self.shutting_down = False
+        self.store = (CheckpointStore(http, settings.supabase_url, settings.supabase_key, settings.checkpoint_key, settings.owner)
+                      if settings.supabase_url else None)
+        self.checkpoint_lock = asyncio.Lock()
+        self.recovery_task = None
+        self.storage_ready = not bool(self.store)
+        self.storage_busy = False
+        if self.store:
+            self.client.checkpoint = self.checkpoint
+
+    def snapshot(self):
+        result = {f.name: getattr(self.session, f.name) for f in fields(Session)
+                  if f.name not in ('stop', 'touched', 'wait_until', 'rows')}
+        result['rows'] = [asdict(row) for row in self.session.rows]
+        return result
+
+    def restore_snapshot(self, data):
+        allowed = {f.name for f in fields(Session)} - {'stop', 'touched', 'wait_until', 'rows'}
+        row_fields = {f.name for f in fields(Row)}
+        session = Session(**{k:v for k,v in data.items() if k in allowed})
+        session.rows = [Row(**{k:v for k,v in row.items() if k in row_fields}) for row in data.get('rows', [])]
+        if not 0 <= session.position <= len(session.rows):
+            raise StorageError('Invalid saved queue position.')
+        return session
+
+    async def checkpoint(self, phase='', row=None, new=False):
+        if not self.store:
+            return
+        async with self.checkpoint_lock:
+            s = self.session
+            if phase in ('attempt_started','before_create') and s.expires_at and time.time() >= s.expires_at:
+                raise JobExpired('Job expired before another request was sent.')
+            if not self.store.owned and not new:
+                raise LeaseLost('No owned checkpoint lease; no account operation allowed.')
+            state = 'cancelled' if s.mode == 'done' and s.stop_reason == 'user_cancel' else ('done' if s.mode == 'done' else 'pending')
+            due = s.wake_at or time.time()
+            await self.store.save(self.snapshot(), state, due, s.expires_at or time.time()+86400, new)
+            if self.store.cancel_requested and s.mode != 'done':
+                s.stop_reason = 'user_cancel'; s.stop.set()
+
+    async def begin_saved_job(self):
+        if not self.store:
+            return
+        record = await self.store.read()
+        if record:
+            if record['state'] == 'pending' or not await self.store.claim():
+                raise StorageError('An unfinished saved batch already exists.')
+        else:
+            self.store.version = 0; self.store.owned = False
+        self.session.expires_at = time.time() + 86400
+        await self.checkpoint('approved', new=True)
+
+    def schedule_recovery(self):
+        if self.store and not self.shutting_down and (not self.recovery_task or self.recovery_task.done()):
+            self.recovery_task = asyncio.create_task(self.recover())
+
+    async def recover(self):
+        if not self.store:
+            return
+        async with self.lock:
+            if self.active or self.shutting_down or self.session.mode in ('password','emails','confirm'):
+                return
+            try:
+                record = await self.store.read()
+                if not record:
+                    self.storage_ready = True; self.storage_busy = False
+                    if self.session.mode == 'recovering':self.session = Session()
+                    return
+                self.storage_ready = True
+                if record['state'] != 'pending':
+                    if self.session.mode in ('idle','recovering'):
+                        self.session = self.restore_snapshot(self.store.decode(record))
+                        self.session.password = ''; self.session.mode = 'done'
+                        if self.session.expires_at and time.time() >= self.session.expires_at:
+                            await self.store.forget(); self.session = Session()
+                    self.storage_busy = False
+                    return
+                self.storage_busy = True
+                record = await self.store.claim()
+                if not record:
+                    self.session.mode = 'recovering'
+                    return
+                s = self.restore_snapshot(self.store.decode(record))
+                self.session = s
+                s.stop_reason = ''
+                s.mode = 'running'
+                s.next_delay = max(s.wake_at - time.time(), 0) if s.wake_at else max(s.next_delay, 0)
+                for row in s.rows[s.position:]:
+                    if row.creation_attempted and not row.api_key and row.status == 'creating':
+                        row.status = 'creation_unknown'
+                        row.note = 'Host stopped during key creation. This named key will NOT be created again automatically.'
+                        row.retryable = False
+                    elif not row.creation_attempted and row.status in ('signing_in','checking_workspace'):
+                        row.failure_stage = row.status
+                        row.status = 'service_unavailable'; row.retryable = True
+                        row.retry_after = max(row.retry_after, 60)
+                        row.note = 'Host interrupted this attempt before key creation. Safe retry budget is retained.'
+                        s.next_delay = max(s.next_delay, 60)
+                if record['cancel_requested']:
+                    s.stop_reason = 'user_cancel'; s.stop.set()
+                elif s.expires_at and time.time() >= s.expires_at:
+                    s.stop_reason = 'expired'; s.stop.set()
+                self.storage_busy = False
+                await self.say('Recovered your encrypted batch checkpoint. Previously finished accounts will not be started again. '
+                               'Uncertain key creations are flagged, not repeated. Remaining queued work will continue automatically.')
+                self.worker = asyncio.create_task(self.run())
+            except (StorageError, ValueError, TypeError, KeyError):
+                self.storage_ready = False; self.storage_busy = True
+                if self.store.owned:
+                    with contextlib.suppress(StorageError):await self.store.release()
+                log.warning('Checkpoint recovery unavailable; no account work started.')
+
+    async def lease_watch(self):
+        while True:
+            await asyncio.sleep(25)
+            if self.store and self.store.owned:
+                try:
+                    await self.store.renew()
+                    if self.store.cancel_requested and self.active:
+                        self.session.stop_reason = 'user_cancel'; self.session.stop.set()
+                except LeaseLost:
+                    if self.active:
+                        self.session.stop_reason = 'lease_lost'; self.session.stop.set()
+                except StorageError:
+                    log.warning('Checkpoint heartbeat unavailable; mutation saves remain mandatory.')
+            elif self.store and not self.active and (self.storage_busy or not self.storage_ready):
+                self.schedule_recovery()
 
     @property
     def active(self):
@@ -248,6 +391,13 @@ class Bot:
                 s.batch_id = secrets.token_hex(5)
                 s.rows = [Row(email, f'tg-{s.batch_id}-{index + 1:04d}') for index, email in enumerate(s.emails)]
                 s.mode = 'running'
+                try:
+                    await self.begin_saved_job()
+                except StorageError:
+                    s.mode = 'recovering'; self.storage_ready = False; self.storage_busy = True
+                    await self.say('Approval could not be confirmed in checkpoint storage. No account work has started here. Recovery will check saved state; do not submit another batch.')
+                    self.schedule_recovery()
+                    return
                 await self.say('Approved: full access, leak auto-disable OFF. Processing sequentially. '
                                'Key creation is attempted once per email. Failures do not pause the batch. Transient errors before creation get one automatic retry after a wait. '
                                '/cancel stops safely; /results sends keys as text.')
@@ -261,12 +411,16 @@ class Bot:
                 await self.say(HELP)
                 return
             if command in ('/status',):
+                if self.storage_busy:
+                    await self.say('An unfinished encrypted job is awaiting recovery or the previous worker lease. Its queue has not been cancelled. Recovery runs automatically when storage and the worker lease are available. /cancel requests cancellation.')
+                    return
                 keys = sum(bool(r.api_key) for r in s.rows)
                 await self.say(f'State: {s.mode}. Emails collected: {len(s.emails)}/{self.settings.maximum}. '
                                f'Accounts finished: {s.position}/{len(s.rows)}. Keys saved: {keys}.\n'
                                f'Messages without readable email addresses skipped: {s.skipped_messages}.\n'
                                f'Automatic wait remaining: {max(0, int(s.wait_until - time.monotonic()))} seconds.\n'
-                               'Password and results are RAM-only. /results sends keys as text. '
+                               f'Encrypted recovery: {"enabled" if self.store else "not configured"}; storage ready: {self.storage_ready}.\n'
+                               '/results sends keys as text. '
                                'No manual /resume is needed; /cancel stops the batch.')
                 return
             if command == '/emails':
@@ -290,6 +444,16 @@ class Bot:
                 await self.export()
                 return
             if command == '/cancel':
+                s.stop_reason = 'user_cancel'
+                if self.store:
+                    try:
+                        await self.store.request_cancel()
+                    except StorageError:
+                        await self.say('Storage is temporarily unavailable. Local work will stop; repeat /cancel when storage recovers to confirm cancellation of any saved job.')
+                    if self.storage_busy and not self.active:
+                        await self.say('Cancellation requested for the saved batch. Its worker will stop safely and clear the current saved password. No queued account should be started after cancellation is received.')
+                        self.schedule_recovery()
+                        return
                 s.stop.set()
                 s.nonce = ''
                 if self.active:
@@ -310,10 +474,20 @@ class Bot:
                 if self.active:
                     await self.say('Use /cancel and wait for it to finish before /forget.')
                     return
+                if self.store:
+                    try:
+                        await self.store.forget()
+                    except StorageError:
+                        await self.say('The saved job could not be removed. Cancel it and wait for recovery before /forget.')
+                        return
                 self.session = Session()
                 await self.say('Input and results discarded from active RAM state. This does not revoke keys or delete Telegram copies.')
                 return
             if command in ('/batch', '/login'):
+                if self.store and (not self.storage_ready or self.storage_busy):
+                    await self.say('An encrypted job is being recovered, or checkpoint storage is unavailable. Please use /status or /cancel; no new batch can replace unfinished work.')
+                    self.schedule_recovery()
+                    return
                 if self.active:
                     await self.say('A batch is running or waiting automatically. Use /status or /cancel first.')
                     return
@@ -325,7 +499,7 @@ class Bot:
                                'I will try to delete that message after reading it. If it looks like a bot command, send /password followed by a space and the password.\n\n'
                                'Bot chats are not end-to-end encrypted; deletion cannot erase every copy. '
                                'Only use accounts you own/control. No key will be created until you approve the batch. '
-                               'Input expires after 15 minutes of inactivity.')
+                               'Input expires after 15 minutes of inactivity. Approved jobs use encrypted Supabase recovery when configured; the encryption key stays in Render. Active-job recovery expires after 24 hours.')
                 return
             if command in ('/resume', '/skip'):
                 await self.say('This version continues automatically, including waits for rate limits. No /resume is needed. '
@@ -407,6 +581,9 @@ class Bot:
     async def automatic_wait(self, seconds, reason):
         s = self.session
         s.wait_until = time.monotonic() + seconds
+        s.wake_at = time.time() + seconds
+        if self.store:
+            await self.checkpoint('waiting')
         s.mode = 'waiting' if seconds >= 5 else 'running'
         if seconds >= 5:
             await self.progress(f'Automatic wait: {int(seconds)} seconds. {reason}\n'
@@ -419,20 +596,26 @@ class Bot:
             return not s.stop.is_set()
         finally:
             s.wait_until = 0
+            if not s.stop.is_set():
+                s.wake_at = 0
+                s.next_delay = 0
             s.mode = 'running'
 
     async def run(self):
         s = self.session
-        rate_streak = 0
-        next_delay = 0
+        rate_streak = s.rate_streak
+        next_delay = max(s.wake_at-time.time(), 0) if s.wake_at else max(s.next_delay, 0)
         final_note = ''
         try:
             while s.position < len(s.rows) and not s.stop.is_set():
+                if s.expires_at and time.time() >= s.expires_at:
+                    s.stop_reason = 'expired'; s.stop.set(); break
                 if next_delay and not await self.automatic_wait(next_delay, 'Respecting the provider cooldown before the next account.'):
                     break
                 next_delay = 0
+                s.next_delay = 0
                 row = s.rows[s.position]
-                for attempt in range(2):
+                for attempt in range(row.attempts, 2):
                     await self.client.account(row, s.password, s.stop)
                     if row.throttled or row.status == 'rate_limited':
                         rate_streak += 1
@@ -442,6 +625,8 @@ class Bot:
                     else:
                         rate_streak = 0
                         next_delay = row.retry_after
+                    s.rate_streak = rate_streak
+                    s.next_delay = next_delay
                     if not (attempt == 0 and row.retryable and not row.creation_attempted
                             and not row.api_key and not s.stop.is_set()):
                         break
@@ -449,7 +634,12 @@ class Bot:
                             'Retrying this transient failure once. Key creation has not started.'):
                         break
                     next_delay = 0
+                next_delay = max(next_delay, row.retry_after)
                 s.position += 1
+                s.next_delay = next_delay
+                s.wake_at = time.time()+next_delay if next_delay else 0
+                if self.store:
+                    await self.checkpoint('account_finished')
                 if row.retryable and row.attempts >= 2:
                     row.note += ' Automatic retry exhausted; moving to the next email.'
                 if row.api_key:
@@ -466,30 +656,70 @@ class Bot:
                 if s.position < len(s.rows) and not next_delay:
                     if not await self.automatic_wait(2, 'Normal sequential pacing.'):
                         break
+        except JobExpired:
+            s.stop_reason = 'expired'; s.stop.set()
+        except StorageError:
+            s.stop_reason = 'storage_error'; s.stop.set()
+            final_note = 'Checkpoint storage unavailable; no uncheckpointed key creation is allowed.'
         except asyncio.CancelledError:
+            s.stop_reason = s.stop_reason or 'host_shutdown'
             s.stop.set()
             final_note = 'Host shutdown interrupted the batch. Review uncertain rows before starting any new batch.'
-        except Exception:
+        except Exception as exc:
+            s.stop_reason = 'internal_error'
             s.stop.set()
             final_note = 'An internal error stopped the worker. Saved results follow; uncertain creations must be checked manually.'
-            log.warning('Batch stopped; sensitive error details suppressed.')
+            log.warning('Batch stopped (%s); sensitive details suppressed.', type(exc).__name__)
         finally:
-            s.mode = 'done'
-            s.wait_until = 0
-            s.password = ''
-            s.touched = time.monotonic()
-            if s.stop.is_set():
-                for row in s.rows:
-                    if row.status == 'queued':
-                        row.status = 'cancelled'
-            await self.export('Saved keys not yet delivered, as text.', only_undelivered=True)
-            failures = [row for row in s.rows if not row.api_key and row.status != 'queued']
-            await self.say(f'Finished/stopped: {s.position}/{len(s.rows)} accounts processed; '
-                           f'{sum(bool(r.api_key) for r in s.rows)} keys saved. {final_note}\n'
-                           'Shared password cleared. Keys are plain-text messages above. /results resends all saved results; /csv is optional. '
-                           'Retry only accounts without a key after resolving their errors. Never blindly rerun an uncertain creation.')
-            for text, _ in result_chunks(failures):
-                await self.say(text)
+            await self.finish_run(final_note)
+
+    async def finish_run(self, final_note=''):
+        s = self.session
+        s.wait_until = 0
+        interrupted = s.stop_reason in ('host_shutdown','storage_error','lease_lost','internal_error')
+        if self.store and interrupted:
+            s.mode = 'recovering'
+            # Leave untouched rows queued; preserve the password only in the
+            # encrypted checkpoint so due work can be recovered automatically.
+            saved = False
+            if self.store.owned:
+                try:
+                    s.wake_at = max(s.wake_at, time.time()+30)
+                    await self.checkpoint('host_interrupted')
+                    saved = True
+                except StorageError:
+                    pass
+                with contextlib.suppress(StorageError):await self.store.release()
+            self.storage_busy = True
+            await self.export('Keys saved before interruption, as text.', only_undelivered=True)
+            await self.say(('Host interrupted this run. The encrypted checkpoint is saved; untouched emails remain queued for automatic recovery.' if saved else
+                            'This worker stopped. The last confirmed encrypted checkpoint remains authoritative; uncertain key creations are never repeated.') +
+                           ' Keys already sent in Telegram remain available. You did not cancel the queued accounts.')
+            s.password = ''  # Database retains approved recovery secret, not this stopped worker.
+            return
+        s.mode = 'done'; s.password = ''; s.touched = time.monotonic()
+        if s.stop.is_set():
+            for row in s.rows:
+                if row.status == 'queued':
+                    row.status = 'cancelled' if s.stop_reason == 'user_cancel' else 'not_processed_interrupted'
+                    row.note = 'Stopped by your /cancel command.' if s.stop_reason == 'user_cancel' else 'Host interruption or job expiry; this account was not attempted.'
+        if self.store:
+            s.expires_at = time.time()+3600
+            try:
+                await self.checkpoint('finished')
+            except StorageError:
+                self.storage_busy = True
+        await self.export('Saved keys not yet delivered, as text.', only_undelivered=True)
+        failures = [row for row in s.rows if not row.api_key and row.status != 'queued']
+        await self.say(f'Finished/stopped: {s.position}/{len(s.rows)} accounts processed; '
+                       f'{sum(bool(r.api_key) for r in s.rows)} keys saved. {final_note}\n'
+                       'Shared password cleared from active state and from a successfully saved completed checkpoint. '
+                       'Keys are text messages above. /results resends saved results; /csv is optional. '
+                       'Retry only failed/unprocessed accounts. Never blindly rerun an uncertain creation.')
+        for text, _ in result_chunks(failures):await self.say(text)
+        if self.store and self.store.owned:
+            with contextlib.suppress(StorageError):await self.checkpoint('delivery_finished')
+            with contextlib.suppress(StorageError):await self.store.release()
 
     async def housekeeping(self):
         while True:
@@ -540,7 +770,8 @@ def create_app(bot):
 
     async def health(request):
         return web.json_response({'ok': True, 'mode': 'telegram-http', 'browser': False, 'webhook_ready': bot.ready,
-                                  'automatic_continuation': True, 'key_delivery': 'plain_text'})
+                                  'automatic_continuation': True, 'key_delivery': 'plain_text',
+                                  'durable_recovery': bool(bot.store), 'storage_ready': bot.storage_ready})
 
     async def root(request):
         return web.Response(text='Telegram-only bot. No browser or control panel. Open your Telegram bot and send /batch.\n')
@@ -561,6 +792,16 @@ def create_app(bot):
         bot.enqueue(update)
         return web.json_response({'ok': True})
 
+    async def job_tick(request):
+        supplied = request.headers.get('X-Job-Wakeup-Secret', '')
+        if not bot.store or not supplied or not hmac.compare_digest(supplied.encode(), bot.settings.wakeup_secret.encode()):
+            raise web.HTTPForbidden()
+        if bot.shutting_down:
+            raise web.HTTPServiceUnavailable()
+        bot.schedule_recovery()
+        return web.json_response({'accepted': True})
+
+    app.router.add_post('/jobs/tick', job_tick)
     app.router.add_get('/', root)
     app.router.add_get('/health', health)
     app.router.add_post('/telegram', webhook)
@@ -577,11 +818,16 @@ def main():
         app = create_app(bot)
         house = asyncio.create_task(bot.housekeeping())
         registration = asyncio.create_task(bot.register())
+        lease = asyncio.create_task(bot.lease_watch())
+        bot.schedule_recovery()
 
         async def shutdown(app):
             bot.shutting_down = True
             house.cancel()
             registration.cancel()
+            lease.cancel()
+            if bot.recovery_task and not bot.recovery_task.done():bot.recovery_task.cancel()
+            bot.session.stop_reason = bot.session.stop_reason or 'host_shutdown'
             bot.session.stop.set()
             for task in list(bot.input_tasks):
                 task.cancel()
@@ -594,7 +840,7 @@ def main():
                     with contextlib.suppress(asyncio.TimeoutError):
                         await asyncio.wait_for(bot.worker, timeout=5)
             bot.session.password = ''
-            await asyncio.gather(house, registration, return_exceptions=True)
+            await asyncio.gather(house, registration, lease, *([bot.recovery_task] if bot.recovery_task else []), return_exceptions=True)
             await http.close()
         app.on_cleanup.append(shutdown)
         return app

@@ -2,7 +2,7 @@
 
 Owner-only Telegram bot for accounts you own or are authorized to manage. It signs in with one shared password, processes emails sequentially, creates one new API key per account, and sends each collected key as a private plain-text message.
 
-**No Chromium, Playwright, browser gateway, screenshots, login links, or control panel.** Only Python and aiohttp are installed. Supabase is not required and no database is used. Keep the Render service on **Free**, with one instance and one Python process.
+**No Chromium, Playwright, browser gateway, screenshots, login links, or control panel.** Only Python and aiohttp are installed. Encrypted Supabase recovery is now configured for the hosted bot. A separate Free project stores checkpoints and schedules due work; the earlier RAM-only mode is still available for local tests but is not suitable for restart-safe batches. Keep the Render service on **Free**, with one instance and one Python process.
 
 ## Phone-only workflow
 
@@ -49,15 +49,28 @@ Owner-only Telegram bot for accounts you own or are authorized to manage. It sig
 - Plain-text keys are delivered immediately. Already delivered keys are not automatically resent at every checkpoint. Failed text delivery is attempted again at checkpoints/finalization while saved keys remain in RAM; it does not recreate keys or pause the account queue. `/results` explicitly resends all saved results. Telegram flood waits are respected too. Optional `/csv` includes attempt counts and failed stages.
 - `/cancel` interrupts an automatic cooldown or safely stops after an in-flight request. `/status` shows an automatic-wait countdown. `/resume` is only a compatibility notice and cannot restart a completed batch.
 
-**Free-host limitation:** removing manual pauses does not make RAM durable. Render can sleep after inactivity or restart during a long cooldown/batch. The bot does not guarantee background completion through those events. Already delivered messages remain in Telegram, but undelivered results, queued work, and passwords can be lost. No paid upgrade, artificial keepalive, database, or durable resume was added. Save results and retry only failed/unprocessed accounts—not the ones that already returned keys.
+## Encrypted recovery and due-job scheduling
+
+The deployed bot now uses a separate **Free Supabase project**. Your existing Supabase project is not modified.
+
+- Only an **approved** batch is checkpointed: remaining emails, progress, account attempt/creation markers, the shared password, cooldown deadlines, and collected keys are encrypted in the app before leaving Render. The encryption key is stored only in Render's environment, not in Supabase or GitHub.
+- The checkpoint is saved **before an account attempt**, **before any key-creation request**, immediately when a key is received, and after account progress/cooldown updates. A failed mandatory checkpoint prevents the next account mutation.
+- A database lease and version check fence out stale/overlapping workers. Normal HTTP operations are bounded; a stopped worker's lease expires after about two minutes. A new worker cannot simply race the old one.
+- Supabase Cron checks once per minute. It sends an authenticated wake request **only if approved unfinished work is due and no current worker holds its lease**. It does not ping Render for idle/completed jobs. Long cooldowns are saved as absolute deadlines, so a restart does not restart the entire delay.
+- Render startup and the scheduler restore the saved queue. Completed accounts are not started again. If a persisted creation intent has an uncertain result, that row becomes `creation_unknown` and is **not recreated**; subsequent queued accounts can proceed. This cannot recover a one-time key whose response was lost, so that named key may need manual review.
+- A shutdown no longer marks untouched accounts `cancelled`. They remain queued in the encrypted checkpoint. Only `/cancel` represents user cancellation. A cancellation request is also recorded in the database and is honored by the active/recovering worker.
+- Successful completion/cancellation removes the password from the **current** checkpoint. Approved jobs expire after 24 hours; completed result checkpoints are retained for one hour. The scheduler removes expired, unleased records. Reference removals/deletion do not guarantee erasure of every provider/device backup or prior copy.
+- Text delivery can be repeated after a crash if its delivery acknowledgement was not checkpointed; it is the **same saved key**, not a new creation. `/results` can retrieve saved results after a restart while the completed checkpoint remains available.
+
+**Free-provider limits still apply.** Scheduler execution and Render cold starts can take a few minutes, not an exact instant. Neither provider has an always-on guarantee here. Provider outages, quota limits, or a paused/unavailable database can delay recovery; the bot fails closed rather than creating keys without a confirmed checkpoint. Keep keys already delivered in Telegram. No paid plan was enabled.
 
 ## Privacy and data lifetime
 
 Telegram bot chats are **not end-to-end encrypted**. Password and email messages are deleted on a best-effort basis after intake; this cannot erase every copy, notification, backup, provider record, or device cache. A deletion failure is reported. Plain-text results and any optional CSV remain in Telegram until you remove them.
 
-The running app does not write passwords, Firebase tokens, or API keys to disk/database. It does not log request bodies, provider error bodies, Telegram URLs/tokens, passwords, or keys. Account refresh tokens are discarded. Passwords are removed from active state after completion/cancellation, or after 15 minutes of inactivity while staged and inactive. Idle results expire after one hour. These are application reference removals, **not guaranteed secure memory erasure**.
+The running app does not write account secrets to local disk. Approved-job passwords and API keys are stored in Supabase only inside authenticated ciphertext; Firebase login/refresh tokens are not checkpointed. It does not log request bodies, provider error bodies, Telegram URLs/tokens, passwords, or keys. Account refresh tokens are discarded. Passwords are removed from active state after completion/cancellation, or after 15 minutes of inactivity while staged and inactive. Idle results expire after one hour. These are application reference removals, **not guaranteed secure memory erasure**.
 
-RAM is lost on Render sleep/restart/deployment. Keep delivered key messages and any optional CSV safe. A graceful shutdown tries to send partial results, but a hard kill cannot guarantee delivery. Stale approval buttons are rejected after restart; unknown creation outcomes must be reviewed manually. Supabase/durable resume is not implemented.
+RAM is lost on Render sleep/restart/deployment, but approved jobs recover from the encrypted checkpoint when configured. Unapproved intake is still RAM-only and must be entered again after a restart. Stale approval buttons are rejected. Unknown creation outcomes require manual review; no distributed design can guarantee recovery of an upstream one-time secret if its response was lost before storage.
 
 Full-access keys with leak auto-disable OFF are deliberately high-risk. Keep results private and revoke any exposed key manually. The bot requires explicit approval before applying these settings.
 
@@ -69,12 +82,15 @@ Set environment variables in Render, not GitHub:
 - `TELEGRAM_WEBHOOK_SECRET`: random URL-safe value, at least 32 characters
 - `ADMIN_CHAT_ID`: the owner's positive Telegram user/private-chat ID; both sender and chat must match
 - `ELEVENLABS_FIREBASE_API_KEY`: the **public Firebase web-client project identifier** used by ElevenLabs' current production web app. This is not a personal ElevenLabs API key or an account password.
-- `MAX_BATCH_ACCOUNTS`: defaults to 100; configurable from 1–1000
+- `MAX_BATCH_ACCOUNTS`: defaults to 100; configurable from 1–1000 (large batches consume more free-tier bandwidth)
+- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`: server-only access to the dedicated checkpoint project
+- `CHECKPOINT_ENCRYPTION_KEY`: generated Fernet key; keep it in Render only and do not rotate it during unfinished jobs
+- `JOB_WAKEUP_SECRET`: an independent secret authenticating `/jobs/tick`; its scheduler copy is stored in Supabase Vault
 - `RENDER_EXTERNAL_URL`: supplied by Render; `PUBLIC_BASE_URL` can override it for other HTTPS hosting
 
 Render exposes `/health` for health checks and `/telegram` for the authenticated webhook. `/` contains a plain Telegram-only notice. Former panel/API/screenshot paths no longer exist. Webhook registration and bot commands are configured automatically. Existing free-host sleep and monthly usage limits still apply; no paid service or second service is needed.
 
-Old `LOW_MEMORY_MODE`, `BATCH_SESSION_MINUTES`, Supabase, and CAPTCHA-solver variables are unused by this version.
+Old `LOW_MEMORY_MODE`, `BATCH_SESSION_MINUTES`, and CAPTCHA-solver variables remain unused. Recovery needs all four Supabase/encryption/wakeup variables together. Apply `checkpoint.sql` to a dedicated project, configure the three named Vault secrets privately, then apply `scheduler.sql`. The scripts do not contain secret values. Anonymous/client roles cannot read the checkpoint table or call its RPCs.
 
 ## Protocol provenance / compatibility
 
@@ -97,4 +113,4 @@ python -m pytest -q -o asyncio_mode=auto
 python app.py
 ```
 
-Tests use synthetic credentials and mocked account responses. They cover approval, owner-only access, webhook authentication, duplicate updates, limits, removal of panel routes, cancellation, automatic cooldowns, safe pre-creation retries, exact observed personal-key payload semantics, uncertain creations, key preservation, plain-text chunking/delivery, and optional CSV safety. Never place real passwords, private API keys, or management tokens in source/tests.
+Tests use synthetic credentials and mocked account responses. They cover approval, owner-only access, webhook authentication, duplicate updates, limits, removal of panel routes, cancellation, automatic cooldowns, safe pre-creation retries, exact observed personal-key payload semantics, uncertain creations, key preservation, plain-text chunking/delivery, optional CSV safety, checkpoint encryption, worker fencing, host-shutdown recovery, cooldown restoration, and non-replay of uncertain creations. Never place real passwords, private API keys, or management tokens in source/tests.

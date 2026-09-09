@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit, parse_qsl
 
 import aiohttp
+from checkpoint import StorageError
 
 API = 'https://api.elevenlabs.io'
 FIREBASE = 'https://identitytoolkit.googleapis.com/v1/accounts:'
@@ -202,6 +203,7 @@ class ElevenClient:
     def __init__(self, http, firebase_key):
         self.http = http
         self.firebase_key = firebase_key
+        self.checkpoint = None
 
     async def request(self, url, body=None, token=None):
         headers = {'Origin': 'https://elevenlabs.io', 'Referer': 'https://elevenlabs.io/',
@@ -242,6 +244,11 @@ class ElevenClient:
                 row.status = 'cancelled'
                 return
             row.status = 'signing_in'
+            if self.checkpoint:
+                await self.checkpoint('attempt_started', row)
+            if stop.is_set():
+                row.status = 'interrupted_before_login'
+                return
             auth = await self.request(FIREBASE + 'signInWithPassword?key=' + self.firebase_key,
                                       {'email': row.email, 'password': password,
                                        'returnSecureToken': True, 'clientType': 'CLIENT_TYPE_WEB'})
@@ -254,6 +261,9 @@ class ElevenClient:
                 row.status = 'protocol_changed'
                 row.note = 'Sign-in identity did not match. No key created.'
                 return
+            if stop.is_set():
+                row.status = 'interrupted_before_create'
+                return
             token = auth.pop('idToken')
             auth.clear()  # Discard refresh token and account metadata immediately.
             lookup = await self.request(FIREBASE + 'lookup?key=' + self.firebase_key, {'idToken': token})
@@ -263,6 +273,9 @@ class ElevenClient:
                 row.note = 'Verify the account email with ElevenLabs. No key created.'
                 return
             lookup.clear()
+            if stop.is_set():
+                row.status = 'interrupted_before_create'
+                return
             row.status = 'checking_workspace'
             workspace = await self.request(API + '/v1/workspace', token=token)
             if workspace.get('third_party_disable_allowed_override') is True:
@@ -274,6 +287,12 @@ class ElevenClient:
                 return
             row.status = 'creating'
             row.creation_attempted = True
+            if self.checkpoint:
+                await self.checkpoint('before_create', row)
+            if stop.is_set():
+                row.creation_attempted = False
+                row.status = 'interrupted_before_create'
+                return
             # Exact personal-key UI semantics: omitted permissions = unrestricted.
             # This call is attempted ONCE. No fallback payloads or automatic retries.
             created = await self.request(API + '/v1/user/create-api-key',
@@ -286,9 +305,15 @@ class ElevenClient:
             row.api_key = key
             row.status = 'created_settings_unverified'
             row.note = 'Key created; settings verification pending. Do not create a replacement automatically.'
+            if self.checkpoint:
+                await self.checkpoint('key_received', row)
+            if stop.is_set():
+                return
             listed = await self.request(API + '/v1/user/api-keys', token=token)
             matches = [item for item in listed.get('api_keys', []) if item.get('name') == row.name]
             metadata = matches[0] if len(matches) == 1 else {}
+            if stop.is_set():
+                return
             # Recheck current workspace policy, not just the pre-creation snapshot.
             workspace = await self.request(API + '/v1/workspace', token=token)
             if 'permissions' in metadata and metadata['permissions'] is None:
@@ -301,6 +326,8 @@ class ElevenClient:
                 row.note = 'Full access and leak auto-disable OFF verified; plan/workspace limits still apply.'
             else:
                 row.note = 'Key created, but requested settings could not all be confirmed. Check this key; do not rerun blindly.'
+        except StorageError:
+            raise
         except ProviderError as exc:
             row.failure_stage = row.status
             row.retry_after = exc.retry_after
